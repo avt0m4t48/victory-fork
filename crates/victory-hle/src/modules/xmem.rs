@@ -72,8 +72,8 @@ const MEM_WRITE_WATCH: u32 = 0x20_0000;
 /// 32-bit memory; else from 4 GiB (kept for 32-bit requests, which the
 /// title's big pools would otherwise crowd out) up to 46 down to 40 bits
 /// from the field at bit 12, or 40 bits without one: the console keeps
-/// title memory there, and its ray-tracing structures must be (Generic Game
-/// Title's BVH builder refuses one above; the title asks for its GPU heap
+/// title memory there, and its ray-tracing structures must be (
+/// the title's BVH builder refuses one above; the title asks for its GPU heap
 /// with no field). Decision 0001.
 fn address_range(flags: u64) -> (usize, usize) {
     let bits = match (flags & ADDRESS_32BIT, flags >> 12 & 7) {
@@ -108,7 +108,7 @@ pub extern "system" fn XMemVirtualAlloc(
     // A reservation of 64 KiB pages takes physical pages later
     // (`XMemMapPhysicalPages`); on the host only a placeholder can.
     // shortcut: committing part of such a reservation later would fail
-    // (Generic Game Title's 23 calls never do); replace that part of the
+    // (the title's 23 calls never do); replace that part of the
     // placeholder then.
     let placeholder = kind & PAGES_64K == PAGES_64K && kind & MEM_COMMIT == 0;
     if placeholder {
@@ -176,7 +176,7 @@ pub struct BasicInformation {
 }
 
 // shortcut: every committed page reports graphics memory and no tag, since
-// all of it is GPU-reachable here (Generic Game Title's BVH builder, the
+// all of it is GPU-reachable here (the title's BVH builder, the
 // only caller, wants graphics memory); remember the flags of
 // `XMemVirtualAlloc` regions if a title tells CPU-only memory apart.
 pub extern "system" fn XMemVirtualQuery(
@@ -221,7 +221,7 @@ type AllocRoutine = extern "system" fn(usize, u64) -> *mut c_void;
 type FreeRoutine = extern "system" fn(*mut c_void, u64);
 
 /// The allocation and free routines the title's exe exports as
-/// `__XMemAllocationHooks__` (Generic Game Title does): `XMemAlloc` and
+/// `__XMemAllocationHooks__` (the title does): `XMemAlloc` and
 /// `XMemFree` call them, for the title's own calls and its middleware's;
 /// the `…Default` exports do not.
 fn hooks() -> [usize; 2] {
@@ -291,7 +291,7 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     };
     // shortcut: the host heap's addresses lie above 2^40, unlike the
     // console's; nothing seen builds ray-tracing structures in this memory
-    // (Generic Game Title uses its GPU heap). Sub-allocate from a
+    // (the title uses its GPU heap). Sub-allocate from a
     // reservation below 2^40 if one does.
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
@@ -399,7 +399,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
         return 0;
     };
     // A pagefile-backed section of `size` bytes, its pages committed when
-    // first mapped or written (`commit`): Generic Game Title asks for 6.1
+    // first mapped or written (`commit`): the title asks for 6.1
     // GiB at once, which a busy host often cannot commit (error 1450).
     // SAFETY: plain section creation.
     let handle = unsafe {
@@ -449,7 +449,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
 }
 
 /// Page numbers count 4 KiB frames, so a 64 KiB page's is a multiple of
-/// 16: Generic Game Title keeps them as 21-bit `number >> 4` and rebuilds
+/// 16: the title keeps them as 21-bit `number >> 4` and rebuilds
 /// them with `<< 4` (128 GiB of pages at most).
 const FRAMES: usize = PAGE >> 12;
 
@@ -635,7 +635,7 @@ pub extern "system" fn XMemMapPhysicalPages(
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
-/// (Generic Game Title passes 0 for addresses to clear).
+/// (the title passes 0 for addresses to clear).
 pub extern "system" fn XMemMapPhysicalPagesScatter(
     addresses: *const *mut c_void,
     n: usize,
@@ -665,7 +665,8 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 
 /// Maps the physical pages shown at `[from, from + len)` at `to` as well,
 /// in place of what `to` shows; `from` 0 unmaps. The GPU's page-mapping
-/// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`): Generic Game Title maps pages into a pool view, then has the GPU map them into its tiled
+/// copies (`victory_gpu`, queue `CopyPageMappingsBatchX`):
+/// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
     let (to, from, len) = (to as usize, from as usize, len as usize);
