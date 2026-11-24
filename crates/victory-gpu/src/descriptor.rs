@@ -13,6 +13,12 @@ use crate::resource::{Memory, PAGEABLE_IIDS};
 #[cfg(windows)]
 pub(crate) mod host;
 
+#[cfg(any(windows, test))]
+/// Bytes of a guest CBV addressable through one desktop D3D12 descriptor.
+pub(crate) fn host_constant_bytes(size: u32) -> u32 {
+    size.min(64 * 1024)
+}
+
 const HEAP_IIDS: [Iid; 4] = [
     guid(
         0x8efb471d,
@@ -992,6 +998,21 @@ static FUNCTIONS: Table<24> = {
 mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
+
+    #[test]
+    fn desktop_constant_buffer_keeps_only_the_bindable_prefix() {
+        for (size, expected) in [
+            (0, 0),
+            (255, 255),
+            (65_535, 65_535),
+            (65_536, 65_536),
+            (65_537, 65_536),
+            (2_785_536, 65_536),
+            (u32::MAX, 65_536),
+        ] {
+            assert_eq!(host_constant_bytes(size), expected, "guest CBV size {size}");
+        }
+    }
 
     /// What newer titles pass; tests use it throughout, so that reading the
     /// placement stays inside the value.

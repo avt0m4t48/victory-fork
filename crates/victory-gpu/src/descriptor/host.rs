@@ -10,8 +10,16 @@ use std::sync::Mutex;
 use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 
-use super::{VIEW_TAG, View, view_at};
+use super::{VIEW_TAG, View, host_constant_bytes, view_at};
 use crate::host::host;
+
+fn constant_desc(gpu: u64, size: u32) -> D3D12_CONSTANT_BUFFER_VIEW_DESC {
+    D3D12_CONSTANT_BUFFER_VIEW_DESC {
+        BufferLocation: gpu,
+        SizeInBytes: host_constant_bytes(size)
+            .next_multiple_of(D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT),
+    }
+}
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
@@ -1217,10 +1225,7 @@ impl HostHeap {
     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
         self.keep(index, None);
         let Some(host) = host() else { return };
-        let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-            BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
-        };
+        let desc = constant_desc(gpu, size);
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
             host.device
@@ -1840,6 +1845,8 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     let device = &host.device;
     match view {
         &View::Constant(address, size) => {
+            // Look up the shadow with the full guest span. A prefix lookup
+            // can select a different overlapping buffer or loose window.
             let shadow = crate::shadow::find(address, u64::from(size))?;
             let gpu = shadow.gpu(address);
             if gpu % 256 != 0 {
@@ -1849,10 +1856,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 );
                 return None;
             }
-            let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
-                BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
-            };
+            let desc = constant_desc(gpu, size);
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
             Some(Some(shadow.buffer.clone()))
@@ -2212,6 +2216,37 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    #[ignore = "requires VICTORY_D3D12_WARP=1 and VICTORY_D3D12_DEBUG=1"]
+    fn oversized_constant_buffer_view_passes_desktop_validation() {
+        assert!(std::env::var_os("VICTORY_D3D12_WARP").is_some());
+        assert!(std::env::var_os("VICTORY_D3D12_DEBUG").is_some());
+        let host = host().expect("D3D12 device");
+        let bytes = 2_785_536;
+        let (buffer, _) = host
+            .upload_buffer(u64::from(bytes))
+            .expect("constant buffer");
+        let heap = HostHeap::new(false, 1).expect("descriptor heap");
+        let index = heap.dynamic(1).expect("descriptor slot");
+        // SAFETY: a live upload buffer and a slot allocated from this heap.
+        let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+        let _ = host.log_messages();
+        heap.constant_at(index, gpu, bytes);
+        assert_eq!(host.log_messages(), None);
+
+        let oversized = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+            BufferLocation: gpu,
+            SizeInBytes: bytes,
+        };
+        // SAFETY: the raw control uses the same buffer and valid descriptor
+        // slot. The debug layer reports the unsupported size.
+        unsafe { host.device.CreateConstantBufferView(Some(&oversized), heap.cpu(index)) };
+        let error = host.log_messages().expect("oversized CBV debug-layer message");
+        assert!(error.to_ascii_lowercase().contains("constant buffer"), "{error}");
+        eprintln!("uncapped control: {error}");
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
