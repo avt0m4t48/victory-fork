@@ -192,14 +192,20 @@ fn show_config() -> Result<()> {
     println!("game_dir    : {}", status(&cfg.game_dir));
     println!("cache_dir   : {}", cfg.cache_dir.display());
     println!("data_dir    : {}", cfg.data_dir.display());
-    match agility::runtime_dir().map(|d| d.join("D3D12Core.dll")) {
-        Some(dll) if dll.exists() => println!(
-            "d3d12 sdk   : {} (version {})",
+    let core = agility::runtime_dir()
+        .map(|dir| dir.join("D3D12Core.dll"))
+        .filter(|dll| dll.is_file());
+    match (cfg!(agility_sdk), core) {
+        (true, Some(dll)) => println!(
+            "d3d12 sdk   : {} (requested version {})",
             dll.display(),
             agility::D3D12SDKVersion
         ),
-        _ => println!(
-            "d3d12 sdk   : not beside the executable (needed on Windows 10: `cargo xtask agility`)"
+        (true, None) => println!(
+            "d3d12 sdk   : this build requests Agility SDK, but D3D12Core.dll is missing (`cargo xtask agility`)"
+        ),
+        (false, _) => println!(
+            "d3d12 sdk   : this build uses the Windows runtime (Windows 10: `cargo xtask agility`, then rebuild)"
         ),
     }
     for t in &cfg.test_titles {

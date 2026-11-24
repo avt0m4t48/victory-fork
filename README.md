@@ -133,9 +133,9 @@ shader model 6.6 (and mesh shaders for the world), Rust (pinned in
 On Windows 10 the in-box D3D12 runtime stops at shader model 6.5, so the host
 refuses every translated pipeline. `cargo xtask agility` fetches Microsoft's
 D3D12 Agility SDK runtime (a pinned, hash-checked NuGet package) into
-`target\<profile>\D3D12\`, where `victory.exe` makes D3D12 load it, and so do
-the `victory-shader` tests that run shaders on a host device. Windows 11
-needs nothing.
+`target\<profile>\D3D12\`. Run it before building `victory.exe` or the
+`victory-shader` tests so their executables request the app-local runtime.
+Builds made without the SDK use the in-box runtime. Windows 11 needs nothing.
 
 The title also needs several GiB of available Windows commit at startup.
 Check **Committed** under **Task Manager → Performance → Memory**. If

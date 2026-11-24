@@ -48,15 +48,17 @@ pub fn run(root: &Path, target: &Path) -> Result<()> {
         }
         println!("D3D12 Agility SDK {VERSION}: {}", dir.display());
     }
-    // victory-shader's build script exports the runtime to its tests only
-    // when it is there, and does not watch for it while it is missing (that
-    // would rebuild the crate every time): make cargo rerun it.
-    let script = root.join("crates/victory-shader/build.rs");
-    std::fs::File::options()
-        .append(true)
-        .open(&script)
-        .and_then(|f| f.set_modified(std::time::SystemTime::now()))
-        .with_context(|| format!("touching {}", script.display()))?;
+    // The build scripts only watch the SDK file once it exists. Invalidate
+    // cached build-script output after installing it so Cargo enables the
+    // exports on the next app and shader test builds.
+    for path in ["apps/victory/build.rs", "crates/victory-shader/build.rs"] {
+        let script = root.join(path);
+        std::fs::File::options()
+            .append(true)
+            .open(&script)
+            .and_then(|f| f.set_modified(std::time::SystemTime::now()))
+            .with_context(|| format!("touching {}", script.display()))?;
+    }
     Ok(())
 }
 
