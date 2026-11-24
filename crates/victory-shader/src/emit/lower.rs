@@ -5478,7 +5478,6 @@ impl<'a> Lower<'a> {
     // dwords (addresses, formats, tiling) have no host value: reading them
     // stops the program.
     fn descriptor_data(&mut self, inst: &Inst, site: Site) -> Result<(), Why> {
-        const OTHER: Why = "a descriptor's address or format read as data";
         let Fields::Smem {
             data: Some(Operand::Scalar { code, .. }),
             ..
@@ -5560,23 +5559,40 @@ impl<'a> Lower<'a> {
             }
             // A buffer view the code only takes the address of, to walk
             // the memory behind it (a ray-tracing structure): the address
-            // from the host, the other dwords have no value.
+            // from the host; and its record count (dword 2), which code
+            // tests to skip its work for an empty buffer, from the raw
+            // view's size in the stride's elements. The other dwords have
+            // no value.
             if count <= 4
                 && let Some((lo, hi)) = self.view_address(site)
             {
-                for k in 0..count {
-                    let reg = Reg::S(code + k as u8);
-                    match k {
-                        0 => self.write(inst, reg, lo, None),
-                        1 => self.write(inst, reg, hi, None),
-                        _ => {
-                            if let Some(v) = inst.write(reg) {
-                                self.vals.insert(v, Val::Missing(OTHER));
-                                self.stale.insert(v);
-                            }
-                        }
-                    }
+                let mut words = vec![(0, lo), (1, hi)];
+                // (best effort: without a handle the count has no value, as before)
+                let src = Source::Loaded { load: site, first: 0 };
+                let used = self.used_kind(&src);
+                let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
+                let props = (11 | if uav { 0x1000 } else { 0 }, 0);
+                if count >= 3
+                    && let Ok(h) = self.handle(site, &src, false, props)
+                {
+                    let stride = used.map_or(0, |u| u.stride);
+                    let c = self.cur;
+                    let i32t = self.s.t.i32;
+                    let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                    let mip = self.s.m.undef(i32t);
+                    let d = self
+                        .s
+                        .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+                    let n = self.s.m.extract(c, d, 0);
+                    let n = if stride > 1 {
+                        let k = self.s.m.i32(stride);
+                        self.s.m.bin(c, Bin::UDiv, n, k)
+                    } else {
+                        n
+                    };
+                    words.push((2, n));
                 }
+                self.write_descriptor_words(inst, code, count, 0, &words);
                 return Ok(());
             }
             // An image's descriptor read only for its size: a program that takes the size
