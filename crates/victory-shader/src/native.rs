@@ -992,6 +992,170 @@ mod tests {
         assert_eq!(stages, [HwStage::Es, HwStage::Vs]);
     }
 
+    // Source-built native records for issue #138. The two container roles
+    // stand in for the vertex and geometry slots of the same graphics PSO.
+    // The instruction words illustrate the handoff and one output record
+    // field. They carry no merged-stage I/O metadata or executable fixture ABI.
+    fn merged_geometry_fixture() -> (Vec<u8>, Vec<u8>) {
+        fn code(words: &[u32]) -> Vec<u8> {
+            words.iter().flat_map(|word| word.to_le_bytes()).collect()
+        }
+
+        let vs = xbch(&fssm(&[(HwStage::Vs, &code(&[0xBF81_0000]))]));
+        let es = xbch(&fssm(&[(
+            HwStage::Es,
+            &code(&[
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+                0xBF8A_0000, // s_barrier
+                0xBE80_2002, // s_setpc_b64 s[2:3] (fixture register pair)
+            ]),
+        )]));
+        let mut gs_words = vec![0xBF80_0000; 17]; // s_nop through byte 0x40
+        gs_words.extend([
+            0xF400_0304,
+            0xFA00_00B8, // at 0x44: s_load_dword s12, s[8:9], 0xb8
+            0xD8D8_0000,
+            0x0200_0000, // ds_read_b32 v2, v0
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0x7E06_020C, // v_mov_b32 v3, s12 (model an LDS output address use)
+            0xD834_0000,
+            0x0000_0203, // ds_write_b32 v3, v2
+            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
+            0xBF90_0022, // s_sendmsg MSG_GS, GS_OP_EMIT, stream 0
+            0xBF90_0012, // s_sendmsg MSG_GS, GS_OP_CUT, stream 0
+            0xBF90_0003, // s_sendmsg MSG_GS_DONE, GS_OP_NOP
+            0xBF81_0000, // s_endpgm
+        ]);
+        let gs = xbch(&fssm(&[(HwStage::Gs, &code(&gs_words))]));
+        let container =
+            |blobs: &[(u32, &[u8])]| crate::dxbc::build(&[(crate::FourCC::DXIL, &part(blobs))]);
+        (
+            container(&[(KIND_NATIVE, &vs), (KIND_NATIVE, &es)]),
+            container(&[(KIND_NATIVE, &gs)]),
+        )
+    }
+
+    fn container_programs(bytes: &[u8]) -> Vec<NativeProgram> {
+        let container = crate::Container::parse(bytes).unwrap();
+        native_programs(container.part(crate::FourCC::DXIL).unwrap().data).unwrap()
+    }
+
+    #[test]
+    fn merged_geometry_fixture_retains_both_native_halves() {
+        use crate::{gfx10, spill, structure};
+
+        let (vertex, geometry) = merged_geometry_fixture();
+        let vertex_programs = container_programs(&vertex);
+        let geometry_programs = container_programs(&geometry);
+        let [vs, es] = &vertex_programs[..] else {
+            panic!("expected VS and ES in the vertex slot")
+        };
+        let [gs] = &geometry_programs[..] else {
+            panic!("expected GS in the geometry slot")
+        };
+        assert_eq!(
+            (vs.stage, es.stage, gs.stage),
+            (HwStage::Vs, HwStage::Es, HwStage::Gs)
+        );
+        assert!(matches!(vs.io, StageIo::Vs { .. }));
+        assert_eq!((&es.io, &gs.io), (&StageIo::None, &StageIo::None));
+
+        let decoded = gfx10::decode(&es.code).unwrap();
+        let names: Vec<_> = decoded.iter().map(|inst| inst.name().unwrap()).collect();
+        assert_eq!(
+            names,
+            ["ds_write_b32", "s_waitcnt", "s_barrier", "s_setpc_b64"]
+        );
+        let es_ir = spill::build(es).unwrap();
+        assert_eq!(es_ir.blocks[0].exit, crate::ir::Exit::Indirect);
+        assert_eq!(
+            structure::structure(&es_ir).unwrap().exits,
+            [structure::LaneExit::Indirect]
+        );
+
+        let decoded = gfx10::decode(&gs.code).unwrap();
+        let text: Vec<_> = decoded
+            .iter()
+            .skip(17)
+            .map(|inst| inst.text(gs.wave64))
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "s_load_dword s12, s[8:9], 0x0000b8",
+                "ds_read_b32 v2, v0",
+                "s_waitcnt lgkmcnt(0)",
+                "v_mov_b32 v3, s12",
+                "ds_write_b32 v3, v2",
+                "s_waitcnt lgkmcnt(0)",
+                "s_sendmsg sendmsg(MSG_GS, GS_OP_EMIT, 0)",
+                "s_sendmsg sendmsg(MSG_GS, GS_OP_CUT, 0)",
+                "s_sendmsg sendmsg(MSG_GS_DONE, GS_OP_NOP)",
+                "s_endpgm",
+            ]
+        );
+    }
+
+    #[test]
+    fn merged_geometry_fixture_reproduces_the_runtime_address_failure() {
+        use crate::{resource, spill, structure};
+
+        let (_, geometry) = merged_geometry_fixture();
+        let programs = container_programs(&geometry);
+        let gs = &programs[0];
+        assert_eq!(gs.stage, HwStage::Gs);
+        assert_eq!((gs.stage.user_sgpr(0), gs.stage.user_sgpr(1)), (8, 9));
+        let program = spill::build(gs).unwrap();
+        let structured = structure::structure(&program).unwrap();
+        assert_eq!(
+            resource::track(&program, &gs.layout, gs.stage, Some(&structured)).unwrap_err(),
+            ShaderError::Unsupported {
+                offset: 0x44,
+                what: "an address in an SGPR that is no root parameter"
+            }
+        );
+    }
+
+    #[test]
+    fn merged_geometry_fixture_cannot_be_translated_as_an_unpaired_shader() {
+        use crate::{DxilProgram, FourCC, ShaderKind, emit, io, spill};
+
+        let (vertex, geometry) = merged_geometry_fixture();
+        let host = emit::translate(&vertex).unwrap();
+        let container = crate::Container::parse(&host.dxil).unwrap();
+        let program = DxilProgram::parse(container.part(FourCC::DXIL).unwrap().data).unwrap();
+        assert_eq!(
+            (host.stage, program.kind),
+            (HwStage::Vs, ShaderKind::Vertex)
+        );
+        assert!(matches!(
+            emit::translate(&geometry),
+            Err(ShaderError::Unsupported { .. })
+        ));
+
+        for stage in [HwStage::Es, HwStage::Gs] {
+            let bytes = if stage == HwStage::Es {
+                &vertex
+            } else {
+                &geometry
+            };
+            let native = container_programs(bytes)
+                .into_iter()
+                .find(|p| p.stage == stage)
+                .unwrap();
+            let program = spill::build(&native).unwrap();
+            assert_eq!(
+                io::raise(&program, &native).unwrap_err(),
+                ShaderError::Unsupported {
+                    offset: 0,
+                    what: "I/O of this stage"
+                }
+            );
+        }
+    }
+
     #[test]
     fn pc_layout_has_none() {
         assert!(native_programs(&[0u8; 64]).unwrap().is_empty());
