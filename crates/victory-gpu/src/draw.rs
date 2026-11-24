@@ -324,6 +324,9 @@ pub(crate) static HEAP_VIEWS_ELSEWHERE: AtomicU64 = AtomicU64::new(0);
 /// index ([`State::heap_buffers`]), and the microseconds they took.
 pub(crate) static HEAP_BUFFER_PASSES: AtomicU64 = AtomicU64::new(0);
 pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
+/// Of [`HEAP_BUFFER_MICROS`]: the buffer views looked at, the host copies
+/// brought up to date, and the textures picked by index made ready.
+pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1357,6 +1360,7 @@ impl State {
             ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
+        let viewed = started.elapsed();
         // Per host copy, the span its picked views cover.
         let mut spans: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, u64, u64)> =
             std::collections::HashMap::new();
@@ -1400,7 +1404,12 @@ impl State {
             }
             shadow.refresh(list, *from, to - from);
         }
+        let refreshed = started.elapsed();
         self.heap_textures(list, heap, host);
+        let parts = [viewed, refreshed - viewed, started.elapsed() - refreshed];
+        for (part, took) in HEAP_PASS_PARTS.iter().zip(parts) {
+            part.fetch_add(took.as_micros() as u64, Ordering::Relaxed);
+        }
         HEAP_BUFFER_PASSES.fetch_add(1, Ordering::Relaxed);
         HEAP_BUFFER_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         static LOGGED: AtomicU64 = AtomicU64::new(0);
@@ -1445,8 +1454,12 @@ impl State {
         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
             return;
         }
-        /// Bytes of texture memory staged per frame.
-        const PER_FRAME: u64 = 192 << 20;
+        // Bytes of texture memory staged per frame: 192 MB, or
+        // `VICTORY_HEAP_TEXTURE_MB`.
+        static PER_FRAME_MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let per_frame = *PER_FRAME_MB.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(192)
+        }) << 20;
         static FRAME: AtomicU64 = AtomicU64::new(u64::MAX);
         static SPENT: AtomicU64 = AtomicU64::new(0);
         let frame = crate::frame::current();
@@ -1499,10 +1512,16 @@ impl State {
         // records the frame, and making and staging 192 MB of textures took
         // 1.6-2.2 s of each of the world's first twenty frames (run 20).
         // The rest waits for the next frames, as it does past the bytes.
-        const SPAN: std::time::Duration = std::time::Duration::from_millis(250);
+        // 250 ms, or `VICTORY_HEAP_TEXTURE_MS`: the time is the recording
+        // thread's, which the frame waits for (in gameplay with 21,565
+        // textures waiting, run vg11: the pass took 300 ms of a 456 ms frame).
+        static SPAN_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let span = std::time::Duration::from_millis(*SPAN_MS.get_or_init(|| {
+            std::env::var("VICTORY_HEAP_TEXTURE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(250)
+        }));
         let began = std::time::Instant::now();
         for (index, write) in due {
-            if SPENT.load(Ordering::Relaxed) >= PER_FRAME || began.elapsed() > SPAN {
+            if SPENT.load(Ordering::Relaxed) >= per_frame || began.elapsed() > span {
                 break;
             }
             // A placed texture whose memory is not mapped (not streamed in
