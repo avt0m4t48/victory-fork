@@ -1262,6 +1262,7 @@ impl<'a> Lower<'a> {
                 let n = i.name();
                 n.starts_with("ds_swizzle")
                     || n.contains("permute")
+                    || n.starts_with("v_permlane")
                     || n.starts_with("v_mbcnt")
                     || matches!(n, "v_readlane_b32" | "v_writelane_b32")
                     || matches!(&i.fields, Fields::Valu(v) if v.dpp.is_some())
@@ -5578,6 +5579,18 @@ impl<'a> Lower<'a> {
                 }
                 return Ok(());
             }
+            // An image's descriptor read only for its size: a program that takes the size
+            // of a texture it does not sample, picked from the heap by an index the code
+            // loads (the width, height and levels of dwords 1-3, the code at hand turning
+            // them into a texel's size). No instruction tells its kind: a 2D texture's view
+            // answers. shortcut: a 3D, array or cube texture there gets that view's numbers.
+            if count == 8 {
+                let src = Source::Loaded { load: site, first: 0 };
+                let h = self.handle(site, &src, false, (2, 0x409))?;
+                let words = self.image_size_words(h, 2, false);
+                self.write_descriptor_words(inst, code, count, 0, &words);
+                return Ok(());
+            }
             return Err("a descriptor read only as data");
         };
         let src = Source::Loaded { load: site, first };
@@ -5631,58 +5644,18 @@ impl<'a> Lower<'a> {
             _ => return Err("a scalar memory read as data"),
         };
         let h = self.handle(site, &src, false, props)?;
-        let c = self.cur;
-        let i32t = self.s.t.i32;
-        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
-        let mip = if image.is_some() && !uav {
-            self.s.m.i32(0)
-        } else {
-            self.s.m.undef(i32t)
-        };
-        let d = self
-            .s
-            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
-        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
         let words: Vec<(u32, V)> = match image {
-            Some(kind) => {
-                let one = self.s.m.i32(1);
-                let w = field(self, 0);
-                let (height, depth) = match kind {
-                    1 => (one, one),
-                    2 => (field(self, 1), one),
-                    6 => (one, field(self, 1)),
-                    _ => (field(self, 1), field(self, 2)),
-                };
-                let levels = if uav { one } else { field(self, 3) };
-                let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
-                let (w, height, depth, levels) = (
-                    less(self, w),
-                    less(self, height),
-                    less(self, depth),
-                    less(self, levels),
-                );
-                let k = |l: &mut Self, v: u32| l.s.m.i32(v);
-                let (k30, k2, k14, k16, mask) = (
-                    k(self, 30),
-                    k(self, 2),
-                    k(self, 14),
-                    k(self, 16),
-                    k(self, 0x3FFF),
-                );
-                let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
-                let hi = self.s.m.bin(c, Bin::LShr, w, k2);
-                let hi = self.s.m.bin(c, Bin::And, hi, mask);
-                let ht = self.s.m.bin(c, Bin::Shl, height, k14);
-                let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
-                let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
-                let base = k(self, 0xFAC | ty << 28);
-                let last = self.s.m.bin(c, Bin::Shl, levels, k16);
-                let d3 = self.s.m.bin(c, Bin::Or, base, last);
-                vec![(1, d1), (2, d2), (3, d3), (4, depth)]
-            }
+            Some(kind) => self.image_size_words(h, kind, uav),
             None => {
+                let c = self.cur;
+                let i32t = self.s.t.i32;
+                let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+                let mip = self.s.m.undef(i32t);
+                let d = self
+                    .s
+                    .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
                 // A raw view counts bytes; the descriptor's record count is in elements.
-                let n = field(self, 0);
+                let n = self.s.m.extract(c, d, 0);
                 let stride = used.map_or(0, |u| u.stride);
                 let n = if props.0 & 0xFF == 11 && stride > 1 {
                     let k = self.s.m.i32(stride);
@@ -5706,8 +5679,64 @@ impl<'a> Lower<'a> {
                 words
             }
         };
+        self.write_descriptor_words(inst, code, count, u32::from(first), &words);
+        Ok(())
+    }
+
+    /// An image descriptor's size fields in the GFX10 layout, from the dimensions of the
+    /// host view `h` of `kind` (as `descriptor_data` explains): (dword, value).
+    fn image_size_words(&mut self, h: V, kind: u32, uav: bool) -> Vec<(u32, V)> {
+        let c = self.cur;
+        let i32t = self.s.t.i32;
+        let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
+        let mip = if uav { self.s.m.undef(i32t) } else { self.s.m.i32(0) };
+        let d = self
+            .s
+            .op(c, "getDimensions", Attr::ReadOnly, dims, 72, &[h, mip]);
+        let field = |l: &mut Self, k: u32| l.s.m.extract(c, d, k);
+        let one = self.s.m.i32(1);
+        let w = field(self, 0);
+        let (height, depth) = match kind {
+            1 => (one, one),
+            2 => (field(self, 1), one),
+            6 => (one, field(self, 1)),
+            _ => (field(self, 1), field(self, 2)),
+        };
+        let levels = if uav { one } else { field(self, 3) };
+        let less = |l: &mut Self, x: V| l.s.m.bin(c, Bin::Sub, x, one);
+        let (w, height, depth, levels) = (
+            less(self, w),
+            less(self, height),
+            less(self, depth),
+            less(self, levels),
+        );
+        let k = |l: &mut Self, v: u32| l.s.m.i32(v);
+        let (k30, k2, k14, k16, mask) = (
+            k(self, 30),
+            k(self, 2),
+            k(self, 14),
+            k(self, 16),
+            k(self, 0x3FFF),
+        );
+        let d1 = self.s.m.bin(c, Bin::Shl, w, k30);
+        let hi = self.s.m.bin(c, Bin::LShr, w, k2);
+        let hi = self.s.m.bin(c, Bin::And, hi, mask);
+        let ht = self.s.m.bin(c, Bin::Shl, height, k14);
+        let d2 = self.s.m.bin(c, Bin::Or, hi, ht);
+        let ty = [0, 8, 9, 0, 10, 0, 12, 13][kind as usize];
+        let base = k(self, 0xFAC | ty << 28);
+        let last = self.s.m.bin(c, Bin::Shl, levels, k16);
+        let d3 = self.s.m.bin(c, Bin::Or, base, last);
+        vec![(1, d1), (2, d2), (3, d3), (4, depth)]
+    }
+
+    /// The `count` dwords an `s_load_dword*` writes from `s[code]` on, the descriptor's
+    /// dword `first` first: those of `words` (dword, value) get their value, the others
+    /// have none (reading them stops the program).
+    fn write_descriptor_words(&mut self, inst: &Inst, code: u8, count: u32, first: u32, words: &[(u32, V)]) {
+        const OTHER: Why = "a descriptor's address or format read as data";
         for k in 0..count {
-            let rel = k.wrapping_sub(u32::from(first));
+            let rel = k.wrapping_sub(first);
             match words.iter().find(|w| w.0 == rel) {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
@@ -5718,7 +5747,6 @@ impl<'a> Lower<'a> {
                 }
             }
         }
-        Ok(())
     }
 
     /// `s_load_dword*` from the program's constant table.
@@ -7317,11 +7345,192 @@ impl<'a> Lower<'a> {
                 };
                 int(self, r)
             }
+            "v_cvt_f32_f64" => {
+                // The double's bits converted with 32-bit integer arithmetic, rounded to
+                // nearest even (the console's default round mode): the module needs no double
+                // type, nor the doubles or 64-bit integer features, for it.
+                let (lo, hi) = self.src64_f(inst, 0)?;
+                let r = self.f64_to_f32_bits(lo, hi);
+                let r = self.as_float(r);
+                float(self, r)
+            }
+            "v_permlane16_b32" | "v_permlanex16_b32" => {
+                // Each lane reads the lane its nibble of the two selects names (src1: positions
+                // 0-7 of its row of 16, src2: 8-15), in its own row (`v_permlane16`) or in the
+                // other row of its 32 lanes (`x16`): the ISA keeps both inside 32-lane halves,
+                // which a host wave of 32 holds as the console's lanes.
+                // shortcut: fetch-inactive and bound control (op_sel) are not modelled: a
+                // source lane that does not run here reads what the host gives, as for DPP.
+                self.cross_lane(false)?;
+                let Some(&Operand::Vector { reg, .. }) = v.src.first() else {
+                    return Err("a v_permlane operand");
+                };
+                let x = self.i32_of(inst.read(Reg::V(reg)).ok_or("a v_permlane operand")?)?;
+                let (lo, hi) = (s(self, 1)?, s(self, 2)?);
+                let lane = self.lane_index();
+                let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+                let (fifteen, seven, eight, two) = (k(self, 15), k(self, 7), k(self, 8), k(self, 2));
+                let pos = self.s.m.bin(c, Bin::And, lane, fifteen);
+                let first_half = self.s.m.cmp(c, pred::IULT, pos, eight);
+                let word = self.s.m.select(c, first_half, lo, hi);
+                let p = self.s.m.bin(c, Bin::And, pos, seven);
+                let sh = self.s.m.bin(c, Bin::Shl, p, two);
+                let pick = self.s.m.bin(c, Bin::LShr, word, sh);
+                let pick = self.s.m.bin(c, Bin::And, pick, fifteen);
+                let row = if name == "v_permlanex16_b32" {
+                    let (not31, sixteen) = (k(self, !31), k(self, 16));
+                    let half = self.s.m.bin(c, Bin::And, lane, not31);
+                    let other = self.s.m.bin(c, Bin::And, lane, sixteen);
+                    let other = self.s.m.bin(c, Bin::Xor, other, sixteen);
+                    self.s.m.bin(c, Bin::Or, half, other)
+                } else {
+                    let not15 = k(self, !15);
+                    self.s.m.bin(c, Bin::And, lane, not15)
+                };
+                let src = self.s.m.bin(c, Bin::Or, row, pick);
+                let r = self.read_lane(x, src);
+                int(self, r)
+            }
             _ => {
                 let r = self.integer(inst, name)?;
                 int(self, r)
             }
         }
+    }
+
+    /// A 64-bit float source's dwords (low, high): a register pair, an inline float constant
+    /// as its double, a literal as the high dword (the null register reads 0); its abs and neg
+    /// modifiers applied to the sign bit.
+    fn src64_f(&mut self, inst: &Inst, k: usize) -> Result<(V, V), Why> {
+        let Fields::Valu(v) = &inst.fields else {
+            unreachable!()
+        };
+        if v.sdwa.is_some() || v.dpp.is_some() {
+            return Err("64-bit operand modifiers");
+        }
+        // 0.5, -0.5, 1.0, -1.0, 2.0, -2.0, 4.0, -4.0, 1/(2 pi), as doubles
+        const DOUBLES: [u64; 9] = [
+            0x3FE0_0000_0000_0000,
+            0xBFE0_0000_0000_0000,
+            0x3FF0_0000_0000_0000,
+            0xBFF0_0000_0000_0000,
+            0x4000_0000_0000_0000,
+            0xC000_0000_0000_0000,
+            0x4010_0000_0000_0000,
+            0xC010_0000_0000_0000,
+            0x3FC4_5F30_6DC9_C883,
+        ];
+        let c = self.cur;
+        let op = *v.src.get(k).ok_or("a missing operand")?;
+        let pair = |l: &mut Self, r: Reg, r1: Reg| -> Result<(V, V), Why> {
+            let lo = l.i32_of(inst.read(r).ok_or("an unread operand")?)?;
+            let hi = l.i32_of(inst.read(r1).ok_or("an unread operand")?)?;
+            Ok((lo, hi))
+        };
+        let (lo, mut hi) = match op {
+            Operand::Vector { reg, .. } => pair(self, Reg::V(reg), Reg::V(reg + 1))?,
+            Operand::Scalar { code, .. } if code != NULL => {
+                pair(self, Reg::S(code), Reg::S(code + 1))?
+            }
+            Operand::Const(128) => (self.s.m.i32(0), self.s.m.i32(0)),
+            Operand::Const(k @ 240..=248) => {
+                let d = DOUBLES[usize::from(k - 240)];
+                (self.s.m.i32(d as u32), self.s.m.i32((d >> 32) as u32))
+            }
+            Operand::Const(_) => return Err("an integer constant as a double"),
+            _ => (self.s.m.i32(0), self.operand(inst, &op)?),
+        };
+        if v.abs >> k & 1 != 0 {
+            let m = self.s.m.i32(0x7FFF_FFFF);
+            hi = self.s.m.bin(c, Bin::And, hi, m);
+        }
+        if v.neg >> k & 1 != 0 {
+            let m = self.s.m.i32(0x8000_0000);
+            hi = self.s.m.bin(c, Bin::Xor, hi, m);
+        }
+        Ok((lo, hi))
+    }
+
+    /// The f32 bits of the double whose dwords are `lo`, `hi`, rounded to nearest even, in
+    /// 32-bit integer arithmetic. A normal result: the exponent's field less one, shifted, plus
+    /// the 24-bit significand with its leading one, rounded on the 29 bits below it (a carry
+    /// runs on into the exponent, to infinity at the top). Below the f32 normals: the
+    /// significand shifted further down (a denormal), rounded on what that shifts out with
+    /// the 29 bits as a sticky bit.
+    fn f64_to_f32_bits(&mut self, lo: V, hi: V) -> V {
+        let c = self.cur;
+        let k = |l: &mut Self, n: u32| l.s.m.i32(n);
+        let (k0, k1) = (k(self, 0), k(self, 1));
+        let sign_bit = k(self, 0x8000_0000);
+        let sign = self.s.m.bin(c, Bin::And, hi, sign_bit);
+        let (k20, k0x7ff) = (k(self, 20), k(self, 0x7FF));
+        let exp = self.s.m.bin(c, Bin::LShr, hi, k20);
+        let exp = self.s.m.bin(c, Bin::And, exp, k0x7ff);
+        let mhi_mask = k(self, 0xF_FFFF);
+        let mhi = self.s.m.bin(c, Bin::And, hi, mhi_mask);
+        // the 24-bit significand with its leading one (none for a zero or a denormal double)
+        let (k3, k29) = (k(self, 3), k(self, 29));
+        let m_top = self.s.m.bin(c, Bin::Shl, mhi, k3);
+        let m_low = self.s.m.bin(c, Bin::LShr, lo, k29);
+        let m23 = self.s.m.bin(c, Bin::Or, m_top, m_low);
+        let normal = self.s.m.cmp(c, pred::NE, exp, k0);
+        let lead_bit = k(self, 0x80_0000);
+        let lead = self.s.m.select(c, normal, lead_bit, k0);
+        let m24 = self.s.m.bin(c, Bin::Or, m23, lead);
+        let rem_mask = k(self, 0x1FFF_FFFF);
+        let rem = self.s.m.bin(c, Bin::And, lo, rem_mask);
+        // the f32 exponent's field (signed)
+        let bias = k(self, 1023 - 127);
+        let e = self.s.m.bin(c, Bin::Sub, exp, bias);
+        // a normal result, valid for fields 1-254
+        let k23 = k(self, 23);
+        let e1 = self.s.m.bin(c, Bin::Sub, e, k1);
+        let field = self.s.m.bin(c, Bin::Shl, e1, k23);
+        let normal_r = self.s.m.bin(c, Bin::Add, field, m24);
+        let half29 = k(self, 0x1000_0000);
+        let n_above = self.s.m.cmp(c, pred::IUGT, rem, half29);
+        let n_tie = self.s.m.cmp(c, pred::EQ, rem, half29);
+        // a denormal result: the significand shifted down by 1 - field (at most 31)
+        let d = self.s.m.bin(c, Bin::Sub, k1, e);
+        let k31 = k(self, 31);
+        let far = self.s.m.cmp(c, pred::IUGT, d, k31);
+        let d = self.s.m.select(c, far, k31, d);
+        let q = self.s.m.bin(c, Bin::LShr, m24, d);
+        let one_up = self.s.m.bin(c, Bin::Shl, k1, d);
+        let out_mask = self.s.m.bin(c, Bin::Sub, one_up, k1);
+        let out = self.s.m.bin(c, Bin::And, m24, out_mask);
+        let d1 = self.s.m.bin(c, Bin::Sub, d, k1);
+        let half = self.s.m.bin(c, Bin::Shl, k1, d1);
+        let sticky = self.s.m.cmp(c, pred::NE, rem, k0);
+        let over_half = self.s.m.cmp(c, pred::IUGT, out, half);
+        let at_half = self.s.m.cmp(c, pred::EQ, out, half);
+        let half_sticky = self.s.m.bin(c, Bin::And, at_half, sticky);
+        let d_above = self.s.m.bin(c, Bin::Or, over_half, half_sticky);
+        let not_sticky = self.s.m.cmp(c, pred::EQ, rem, k0);
+        let d_tie = self.s.m.bin(c, Bin::And, at_half, not_sticky);
+        let below = self.s.m.cmp(c, pred::SLT, e, k1);
+        let r = self.s.m.select(c, below, q, normal_r);
+        let above = self.s.m.select(c, below, d_above, n_above);
+        let tie = self.s.m.select(c, below, d_tie, n_tie);
+        // to nearest, ties to even
+        let odd = self.s.m.bin(c, Bin::And, r, k1);
+        let odd = self.s.m.cmp(c, pred::NE, odd, k0);
+        let tie_odd = self.s.m.bin(c, Bin::And, tie, odd);
+        let up = self.s.m.bin(c, Bin::Or, above, tie_odd);
+        let up = self.s.m.cast(c, Cast::ZExt, up, self.s.t.i32);
+        let r = self.s.m.bin(c, Bin::Add, r, up);
+        // past the largest f32: infinity; NaN stays a (quiet) NaN
+        let inf = k(self, 0x7F80_0000);
+        let k254 = k(self, 254);
+        let huge = self.s.m.cmp(c, pred::SGT, e, k254);
+        let r = self.s.m.select(c, huge, inf, r);
+        let special = self.s.m.cmp(c, pred::EQ, exp, k0x7ff);
+        let any = self.s.m.bin(c, Bin::Or, mhi, lo);
+        let nan = self.s.m.cmp(c, pred::NE, any, k0);
+        let qnan = k(self, 0x7FC0_0000);
+        let nonfinite = self.s.m.select(c, nan, qnan, inf);
+        let r = self.s.m.select(c, special, nonfinite, r);
+        self.s.m.bin(c, Bin::Or, r, sign)
     }
 
     /// A 64-bit source (a register pair; inline constants sign-extend).

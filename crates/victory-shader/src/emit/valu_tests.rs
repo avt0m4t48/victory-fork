@@ -475,6 +475,152 @@ fn v_cmp_lg_is_false_for_nan() {
     }
 }
 
+/// The double `d` as root constants s0 (low dword) and s1 (high), in v1 and v2.
+fn double_inputs(d: f64) -> [u32; 4] {
+    let b = d.to_bits();
+    [b as u32, (b >> 32) as u32, 0, 0]
+}
+
+#[test]
+fn v_cvt_f32_f64_rounds_to_nearest_even() {
+    // v_cvt_f32_f64 v0, v[1:2] (VOP1 opcode 0x00f)
+    let shader = build_valu_cs(&[vop1(0x00F, 0, vgpr(1))]);
+    let p = |e: i32| 2f64.powi(e);
+    let doubles: Vec<f64> = vec![
+        0.0,
+        -0.0,
+        1.0,
+        -2.5,
+        1.0 / 3.0,
+        -1.0 / 3.0,
+        f64::from(f32::MAX),
+        // ties: to even below (1 + 2^-24), up (1 + 3 * 2^-24)
+        1.0 + p(-24),
+        1.0 + 3.0 * p(-24),
+        1.0 + p(-24) + p(-40),
+        // the rounding carries into the exponent, and past the largest f32 to infinity
+        2.0 - p(-25),
+        f64::from(f32::MAX) * (1.0 + p(-25)),
+        3.5e38,
+        -1e300,
+        f64::MAX,
+        // f32 denormals, their ties, and below them
+        1e-40,
+        -1e-40,
+        f64::from(f32::from_bits(1)),
+        f64::from(f32::from_bits(1)) * 0.5,
+        f64::from(f32::from_bits(1)) * 0.75,
+        f64::from(f32::from_bits(3)) * 0.5,
+        f64::from(f32::MIN_POSITIVE) * (1.0 - p(-30)),
+        1e-46,
+        1e-300,
+        f64::from_bits(1),
+        123456.789,
+        -0.1,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    let inputs: Vec<[u32; 4]> = doubles.iter().map(|&d| double_inputs(d)).collect();
+    run_cases(&shader, &inputs, |backend, i, _, got| {
+        let d = doubles[i];
+        let want = (d as f32).to_bits();
+        if d.is_nan() {
+            assert!(f32::from_bits(got).is_nan(), "{backend}: v_cvt_f32_f64(NaN) = {got:#010x}");
+        } else {
+            assert_eq!(got, want, "{backend}: v_cvt_f32_f64({d:e} / {:#018x}) = {got:#010x}, want {want:#010x}", d.to_bits());
+        }
+    });
+}
+
+#[test]
+fn v_cvt_f32_f64_takes_modifiers_and_inline_doubles() {
+    let d: f64 = -1.0 / 3.0;
+    // VOP3 0x18f: |v[1:2]|, -v[1:2], and the result times 2 (omod 1)
+    for (abs, neg, omod, want) in [
+        (1, 0, 0, (d.abs() as f32).to_bits()),
+        (0, 1, 0, ((-d) as f32).to_bits()),
+        (0, 0, 1, ((d as f32) * 2.0).to_bits()),
+    ] {
+        let shader = build_valu_cs(&vop3_mod(0x18F, 0, vgpr(1), 0, 0, abs, neg, omod, false));
+        run_cases(&shader, &[double_inputs(d)], |backend, _, _, got| {
+            assert_eq!(got, want, "{backend}: abs {abs} neg {neg} omod {omod}: {got:#010x}, want {want:#010x}");
+        });
+    }
+    // inline constants are doubles here: 1.0 (242), -4.0 (247), 1/(2 pi) (248), 0 (128)
+    for (code, want) in [(242u16, 1.0f32), (247, -4.0), (248, (0.5 / std::f64::consts::PI) as f32), (128, 0.0)] {
+        let shader = build_valu_cs(&[vop1(0x00F, 0, code)]);
+        run_cases(&shader, &[[0; 4]], |backend, _, _, got| {
+            assert_eq!(got, want.to_bits(), "{backend}: inline constant {code}: {got:#010x}");
+        });
+    }
+}
+
+/// MUBUF `buffer_store_dword vdata, vaddr, s[srsrc:srsrc+3], 0 offen offset:byte_off`.
+const fn buffer_store_dword_offen(vdata: u8, vaddr: u8, srsrc: u8, byte_off: u16) -> [u32; 2] {
+    [
+        0x38 << 26 | 0x1C << 18 | 1 << 12 | (byte_off as u32 & 0xFFF),
+        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
+    ]
+}
+
+/// What `v_permlane16_b32` (`x16`: `v_permlanex16_b32`) gives lane `lane` of 32, whose v0 is
+/// its lane number, with selects `lo` and `hi`.
+fn permlane_reference(lane: u32, lo: u32, hi: u32, x16: bool) -> u32 {
+    let pos = lane & 15;
+    let word = if pos < 8 { lo } else { hi };
+    let pick = word >> (4 * (pos & 7)) & 15;
+    let row = if x16 { (lane & 16) ^ 16 } else { lane & 16 };
+    row | pick
+}
+
+/// A wave of 32 lanes: each lane permutes its lane number with `v_permlane16_b32` or
+/// `v_permlanex16_b32` (selects in s0, s1) and stores it at dword 64 + its lane, on the
+/// hardware adapter (WARP's waves are not the console's 32 lanes).
+#[test]
+fn v_permlane16_and_x16_pick_lanes_by_the_selects() {
+    for (op, x16) in [(0x377u16, false), (0x378, true)] {
+        let mut body = Vec::new();
+        body.extend_from_slice(&vop3(op, 5, vgpr(0), sgpr(0), sgpr(1)));
+        // v_lshlrev_b32 v6, 2, v0 (VOP2 0x1a)
+        body.push(0x1A << 25 | 6 << 17 | 128 + 2);
+        body.extend_from_slice(&buffer_store_dword_offen(5, 6, 8, 256));
+        let shader = build_cs(&body, 32, 0);
+        for (lo, hi) in [(0x7654_3210u32, 0xFEDC_BA98u32), (0x0123_4567, 0x89AB_CDEF), (0x3333_0000, 0xF0F0_A5A5)] {
+            let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+            let Ok(host) = Host::new(false) else {
+                eprintln!("no SM 6.6 hardware device; not run");
+                return;
+            };
+            let (root, pso) = host.compute_pipeline(&shader).expect("compute_pipeline");
+            let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+            for u in &shader.user_data {
+                ud[u.index as usize] = match (u.root, u.slot) {
+                    (RootType::Constants, 0) => [lo, hi, 0, 0][u.dword as usize],
+                    (RootType::Table, 1) => 0,
+                    other => panic!("unexpected user data {other:?}"),
+                };
+            }
+            let out = host
+                .dispatch(
+                    &root,
+                    &pso,
+                    &Dispatch {
+                        roots: vec![(0, Root::Constants(ud))],
+                        views: &[View::RawUav(96)],
+                        samplers: &[],
+                        groups: [1, 1, 1],
+                    },
+                )
+                .expect("dispatch");
+            for lane in 0..32u32 {
+                let want = permlane_reference(lane, lo, hi, x16);
+                assert_eq!(out[0][64 + lane as usize], want, "x16 {x16}, selects {lo:#010x} {hi:#010x}, lane {lane}");
+            }
+        }
+    }
+}
+
 #[test]
 fn v_fract_f32_never_returns_one() {
     // v_fract_f32 v0, v1 (VOP1 opcode 0x020)
