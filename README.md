@@ -15,6 +15,16 @@ What vx-layer adds on top of the fork's commit 4e17478:
 - **Batched remaps** (`VICTORY_REMAP_BATCH=1`): a scatter remap call's pages are
   remapped under one hold of the lock that texture refreshes wait on, not one
   per page.
+- **Shader translation**: textures whose size a shader reads without sampling
+  them, a buffer descriptor's record count, `v_cvt_f32_f64` (in 32-bit integer
+  arithmetic, round to nearest even) and `v_permlane16`/`v_permlanex16`, each
+  with GPU tests where the crate has a harness for it.
+- **Speed switches** (defaults unchanged): `VICTORY_HEAP_TEXTURE_MS` /
+  `VICTORY_HEAP_TEXTURE_MB` set the per-frame budget (250 ms / 192 MB) of the
+  pass that readies textures picked by index, which runs on a recording thread
+  the frame waits for; `VICTORY_WIDE_THREADS` sizes the pool behind the fork's
+  `VICTORY_WIDE_REFRESH`, `VICTORY_WIDE_MERGE` and `VICTORY_WIDE_BACK`; the
+  frame line splits that pass into views, refreshes and textures.
 - **A launcher with measured speed settings**, `tools/vx-play.ps1`: texture
   refreshes that do not wait for the title's remaps (`VICTORY_TEXTURE_NO_WAIT=1`),
   a 24 ms cap on pipeline waits (`VICTORY_PIPELINE_WAIT_MS=24`), and the fork's
@@ -22,9 +32,11 @@ What vx-layer adds on top of the fork's commit 4e17478:
   VICTORY_CARD_BUFFERS_MB=2048`. On an RTX 4090 the title's opening cutscene
   went from 0.5–3 s per frame to 0.28–0.44 s, with no device loss.
 
-Known problems (open): some materials and walls are missing (ten shaders do not
-translate yet), many surfaces show little texture detail, frames stutter, and
-the startup screens flicker (stale vertex data on alternate frames).
+Known problems (open): some materials and walls are missing (a few shaders still
+do not translate, and five compute programs need 64-lane waves that NVIDIA does
+not offer), many surfaces show little texture detail, frames stutter and are
+slow (2-4 fps in gameplay), and the startup screens flicker (stale vertex data
+on alternate frames).
 
 Build: `cargo build --release -p victory`; run:
 `powershell -ExecutionPolicy Bypass -File tools\vx-play.ps1 -GameExe "<game folder>\<title exe>"`
