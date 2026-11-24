@@ -327,6 +327,9 @@ pub(crate) static HEAP_BUFFER_MICROS: AtomicU64 = AtomicU64::new(0);
 /// Of [`HEAP_BUFFER_MICROS`]: the buffer views looked at, the host copies
 /// brought up to date, and the textures picked by index made ready.
 pub(crate) static HEAP_PASS_PARTS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// Slots the views part looked at: the changed ones, or all of them every
+/// 16th pass.
+pub(crate) static HEAP_PASS_SLOTS: AtomicU64 = AtomicU64::new(0);
 /// Textures brought up to date for shaders that pick them by index
 /// ([`State::heap_textures`]), the bytes of their memory, and the slots
 /// still waiting.
@@ -1321,6 +1324,7 @@ impl State {
             changed
         };
         *passes += 1;
+        HEAP_PASS_SLOTS.fetch_add(slots.len() as u64, Ordering::Relaxed);
         // Whether the device was there before the pass: a view that removes
         // it is named below.
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

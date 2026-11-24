@@ -278,7 +278,23 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
         let page = j.found[k] / PAGE;
         j.written.insert(page, now);
     }
+    #[cfg(feature = "diagnostics")]
+    note_dirty(&j.found[..count]);
     true
+}
+
+/// Counts the kernel's written 4 KiB pages `found` (in address order, as
+/// the kernel gives them) and the 64 KiB units they fall in.
+#[cfg(feature = "diagnostics")]
+fn note_dirty(found: &[usize]) {
+    use crate::copystat::{C, add};
+    let units = found
+        .iter()
+        .map(|&at| at / PAGE)
+        .fold((0u64, usize::MAX), |(n, last), unit| (n + u64::from(unit != last), unit))
+        .0;
+    add(C::DirtyKernelPages, found.len() as u64);
+    add(C::DirtyUnits, units);
 }
 
 /// What [`writes`] would say of `[start, end)` from the journal alone, if
@@ -355,6 +371,8 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
+    #[cfg(feature = "diagnostics")]
+    note_dirty(&j.found[..count]);
     let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
     for page in pages.collect::<Vec<_>>() {
         j.written.insert(page, now);
