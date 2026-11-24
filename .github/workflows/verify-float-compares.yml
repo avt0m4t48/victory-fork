@@ -14,14 +14,22 @@ jobs:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
+          fetch-depth: 3
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
+      - name: Check the fixed WARP readback
+        shell: pwsh
+        run: |
+          cargo test --locked -p victory-shader float_compares_that_are_always_false_or_true -- --nocapture
       - name: Check the unfixed WARP failure
         shell: pwsh
         run: |
+          git restore --source=4e17478 -- crates/victory-shader/src/emit/lower.rs crates/victory-shader/src/emit/bitcode.rs
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $output = & cargo test --locked -p victory-shader float_compares_that_are_always_false_or_true -- --nocapture 2>&1
           $code = $LASTEXITCODE
           $output | ForEach-Object { Write-Output $_ }
           if ($code -eq 0 -or ($output -join "`n") -notmatch 'dispatch failed.*(suspend|removed|hung|0x887A000[567])') {
             throw 'The unpatched shader did not reproduce WARP device loss'
           }
+          exit 0
