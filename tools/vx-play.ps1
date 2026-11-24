@@ -1,0 +1,43 @@
+# vx-layer launcher: runs your own dump of an Xbox Series title with this build, with the speed
+# settings measured on an RTX 4090 (see README, "vx-layer"). Offline by design; the game folder is only
+# read. Nothing here is specific to one machine: every path is a parameter.
+#
+#   powershell -ExecutionPolicy Bypass -File tools\vx-play.ps1 -GameExe "<game folder>\<title exe>"
+#   ... -Config <victory.toml>   config file (default: victory.toml next to the repository root)
+#   ... -Exe <victory.exe>       build to run (default: target\release\victory.exe)
+#   ... -SeriesS                 the Series S profile (its FSR4 upscaler does not run on NVIDIA yet)
+#   ... -NoSpeedSwitches         the fork's defaults instead of the settings below
+#   ... -Logs <folder>           where stdout/stderr go (default: .\runs)
+#
+# Keyboard is a pad while the window has focus: Enter = A, Backspace = B, W A S D = left stick,
+# I J K L = right stick, arrows = D-pad, Q / E shoulders, Z / C triggers, Esc = Menu, Tab = View.
+# The window title shows fps, ms per frame and draws per frame.
+param(
+    [Parameter(Mandatory = $true)][string]$GameExe,
+    [string]$Exe = (Join-Path $PSScriptRoot '..\target\release\victory.exe'),
+    [string]$Config = (Join-Path $PSScriptRoot '..\victory.toml'),
+    [string]$Logs = (Join-Path (Get-Location) 'runs'),
+    [switch]$SeriesS,
+    [switch]$NoSpeedSwitches
+)
+if (-not (Test-Path $Exe)) { throw "no build at $Exe: cargo build --release -p victory" }
+if (-not (Test-Path $GameExe)) { throw "no title executable at $GameExe" }
+if (Test-Path $Config) { $env:VICTORY_CONFIG = (Resolve-Path $Config).Path }
+if (-not $NoSpeedSwitches) {
+    # texture refreshes read title memory through the kernel instead of waiting for the title's remaps
+    $env:VICTORY_TEXTURE_NO_WAIT = '1'
+    # a frame waits at most 24 ms for pipelines still being built (draws without one are left out)
+    $env:VICTORY_PIPELINE_WAIT_MS = '24'
+    # small pipelines first; big compute programs on fewer workers (vx-layer)
+    $env:VICTORY_PIPELINE_SMALL_FIRST = '1'
+    # the fork's own submission and card-buffer speed-ups
+    $env:VICTORY_LATE_WAIT = '3'
+    $env:VICTORY_WIDE_BACK = '1'
+    $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    $env:VICTORY_CARD_BUFFERS_MB = '2048'
+}
+New-Item -ItemType Directory -Force $Logs | Out-Null
+$tag = 'play-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
+$console = if ($SeriesS) { 'series-s' } else { 'series-x' }
+$p = Start-Process -FilePath $Exe -ArgumentList 'run', "`"$GameExe`"", '--execute', '--console', $console -RedirectStandardOutput (Join-Path $Logs "$tag-stdout.txt") -RedirectStandardError (Join-Path $Logs "$tag-stderr.txt") -PassThru
+"started ($console), pid $($p.Id); log: $(Join-Path $Logs "$tag-stderr.txt")"

@@ -1,3 +1,39 @@
+# vx-layer
+
+A fork of the work-in-progress VIctory fork by fxceless (itself a fork of
+[VIctory](https://github.com/Marvisak/VIctory)), tuned for speed on an NVIDIA
+RTX 4090. Everything below the "VIctory fork (work in progress)" heading is
+that fork's README, unchanged; its credits and licence apply here too
+(GPL-3.0-or-later). **No game files, code or assets are included.**
+
+What vx-layer adds on top of the fork's commit 4e17478:
+
+- **Pipelines: small ones first** (`VICTORY_PIPELINE_SMALL_FIRST=1`): big compute
+  programs, which take NVIDIA's compiler minutes, build on fewer workers, so the
+  small pipelines a frame needs are not queued behind them
+  (`VICTORY_PIPELINE_BIG_KB`, `VICTORY_PIPELINE_BIG_WORKERS` tune it).
+- **Batched remaps** (`VICTORY_REMAP_BATCH=1`): a scatter remap call's pages are
+  remapped under one hold of the lock that texture refreshes wait on, not one
+  per page.
+- **A launcher with measured speed settings**, `tools/vx-play.ps1`: texture
+  refreshes that do not wait for the title's remaps (`VICTORY_TEXTURE_NO_WAIT=1`),
+  a 24 ms cap on pipeline waits (`VICTORY_PIPELINE_WAIT_MS=24`), and the fork's
+  own `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1
+  VICTORY_CARD_BUFFERS_MB=2048`. On an RTX 4090 the title's opening cutscene
+  went from 0.5–3 s per frame to 0.28–0.44 s, with no device loss.
+
+Known problems (open): some materials and walls are missing (ten shaders do not
+translate yet), many surfaces show little texture detail, frames stutter, and
+the startup screens flicker (stale vertex data on alternate frames).
+
+Build: `cargo build --release -p victory`; run:
+`powershell -ExecutionPolicy Bypass -File tools\vx-play.ps1 -GameExe "<game folder>\<title exe>"`
+(copy `victory.example.toml` to `victory.toml` and point it at your files first).
+
+Developed with [Claude Code](https://claude.com/claude-code) (Claude Opus 5.5).
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
