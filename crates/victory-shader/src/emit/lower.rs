@@ -3212,6 +3212,22 @@ impl<'a> Lower<'a> {
         self.s.m.select(c, away, stepped, h)
     }
 
+    /// Narrow a floating-point ALU result using the selected rounding mode.
+    fn f16_alu_result(&mut self, f: V) -> V {
+        if f16_nearest_on() {
+            self.f16_nearest(f)
+        } else {
+            self.s.op(
+                self.cur,
+                "legacyF32ToF16",
+                Attr::ReadNone,
+                self.s.t.i32,
+                130,
+                &[f],
+            )
+        }
+    }
+
     /// `f` as an f16 in the low bits, rounded to nearest, ties to even, as the console's
     /// 16-bit float operations round, whatever the host's own conversion does: D3D lets
     /// `f32tof16` round toward zero, and the NVIDIA driver's does (measured on an RTX 4070:
@@ -7042,9 +7058,7 @@ impl<'a> Lower<'a> {
                     Some(o) => self.i32_of(o)?,
                     None => self.s.m.i32(0),
                 };
-                let h = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[r]);
+                let h = self.f16_alu_result(r);
                 let (keep, h) = if name == "v_fma_mixhi_f16" {
                     let k16 = self.s.m.i32(16);
                     (0xFFFF, self.s.m.bin(c, Bin::Shl, h, k16))
@@ -7067,11 +7081,8 @@ impl<'a> Lower<'a> {
                 int(self, r)
             }
             "v_cvt_f16_f32" if v.opsel == 0 => {
-                // Rounded to nearest even (the MODE default) into the low half.
                 let a = f(self, 0)?;
-                let r = self
-                    .s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, self.s.t.i32, 130, &[a]);
+                let r = self.f16_alu_result(a);
                 let Some(Operand::Vector { reg, .. }) = v.dst else {
                     return Err("a 16-bit result outside a VGPR");
                 };
@@ -7569,15 +7580,7 @@ impl<'a> Lower<'a> {
             if v.clamp {
                 f = l.unary(7, f);
             }
-            // The console rounds to nearest; the host's conversion may round toward zero
-            // (NVIDIA's does), one step of the last place lower where the two differ.
-            // shortcut: the host's conversion unless `VICTORY_F16_NEAREST=1`
-            // ([`f16_nearest_on`]), which costs a dozen instructions per result.
-            let h = if f16_nearest_on() {
-                l.f16_nearest(f)
-            } else {
-                l.s.op(l.cur, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
-            };
+            let h = l.f16_alu_result(f);
             l.write_half(inst, h, guard)
         };
         if name == "v_cvt_f16_f32" {
@@ -7875,7 +7878,7 @@ impl<'a> Lower<'a> {
             return Err("modifiers on a packed integer operation");
         }
         let c = self.cur;
-        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        let f32t = self.s.t.f32;
         let mut halves = Vec::new();
         for high in [false, true] {
             let mut xs = Vec::new();
@@ -7907,8 +7910,7 @@ impl<'a> Lower<'a> {
                 if v.clamp {
                     f = self.unary(7, f);
                 }
-                self.s
-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                self.f16_alu_result(f)
             } else {
                 let k16 = self.s.m.i32(16);
                 let sext = |l: &mut Self, x: V| {

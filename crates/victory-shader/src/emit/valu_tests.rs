@@ -309,6 +309,56 @@ fn packed_add_selects_halves_of_inline_constants() {
 }
 
 #[test]
+fn packed_and_mixed_f16_alu_use_requested_rounding() {
+    // VOP3P with v0 as the destination and v1 through v3 as sources.
+    let packed_op = |op: u32, high: u32| {
+        [
+            0xCC00_0000 | op << 16 | (high & 4) << 12,
+            u32::from(vgpr(1))
+                | u32::from(vgpr(2)) << 9
+                | u32::from(vgpr(3)) << 18
+                | (high & 3) << 27,
+        ]
+    };
+    let round_up = [0xBC01_3C01, 0x9000_1000, 0, 0];
+    let mixed = [
+        (1.0f32 + 1.0 / 1024.0).to_bits(),
+        1.0f32.to_bits(),
+        (1.0f32 / 2048.0).to_bits(),
+        0xAABB_CCDD,
+    ];
+    for (name, words, input, expected) in [
+        ("v_pk_add_f16", packed_op(0x0F, 3), round_up, 0xBC02_3C02u32),
+        (
+            "v_pk_fma_f16",
+            packed_op(0x0E, 7),
+            [round_up[0], 0x3C00_3C00, round_up[1], 0],
+            0xBC02_3C02,
+        ),
+        ("v_fma_mixlo_f16", packed_op(0x21, 0), mixed, 0xAABB_3C02),
+        ("v_fma_mixhi_f16", packed_op(0x22, 0), mixed, 0x3C02_CCDD),
+        (
+            "v_cvt_f16_f32 (VOP3)",
+            vop3(0x18A, 0, vgpr(1), 0, 0),
+            [(1.0f32 + 3.0 / 2048.0).to_bits(), 0, 0, mixed[3]],
+            0xAABB_3C02,
+        ),
+    ] {
+        let shader = |nearest| {
+            let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
+            let shader = build_valu_cs(&[vop1(0x001, 0, vgpr(4)), words[0], words[1]]);
+            lower::TEST_F16_NEAREST.set(was);
+            shader
+        };
+        let nearest = shader(true);
+        assert!(nearest.dxil != shader(false).dxil, "{name} ignored rounding mode");
+        run_cases(&nearest, &[input], |backend, _, _, got| {
+            assert_eq!(got, expected, "{backend}: {name}");
+        });
+    }
+}
+
+#[test]
 fn v_med3_f32_matches_rdna2_with_nan() {
     // v_med3_f32 v0, v1, v2, v3 (VOP3 opcode 0x157)
     let shader = build_valu_cs(&vop3(0x157, 0, vgpr(1), vgpr(2), vgpr(3)));
