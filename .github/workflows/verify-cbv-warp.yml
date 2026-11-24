@@ -1,0 +1,28 @@
+name: Desktop CBV size verification
+on:
+  push:
+    branches: [verify/host-cbv-size]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_D3D12_DEBUG: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - shell: pwsh
+        run: |
+          cargo test --locked -p victory-gpu desktop_constant_buffer_keeps_only_the_bindable_prefix
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          $output = & cargo test --locked -p victory-gpu --features diagnostics descriptor::host::tests::oversized_constant_buffer_view_passes_desktop_validation -- --ignored --exact --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or ($output -join "`n") -notmatch 'uncapped control:.*2785536') {
+            throw 'The native oversized CBV control did not produce the expected debug-layer error'
+          }
