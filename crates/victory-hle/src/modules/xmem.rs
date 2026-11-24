@@ -597,24 +597,33 @@ pub extern "system" fn XMemMapPhysicalPages(
     n: usize,
     pages: *const usize,
 ) -> *mut c_void {
-    let base = address as usize;
     let mut physical = physical();
     // Until the pages are mapped again: `unmap` takes whole views away and
     // maps what stays of them again, and a mapped view is a reservation
     // until it is committed. A read of title memory in place must not fall
     // into that gap (`victory_gpu::title_memory_remapping`).
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, base, n * PAGE);
-    if pages.is_null() {
-        return address;
+    // SAFETY: the title passes `n` page numbers unless null.
+    let pages = (!pages.is_null()).then(|| unsafe { std::slice::from_raw_parts(pages, n) });
+    if map_pages(&mut physical, address as usize, n, pages) {
+        address
+    } else {
+        std::ptr::null_mut()
     }
-    // SAFETY: the title passes `n` page numbers.
-    let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+}
+
+/// [`XMemMapPhysicalPages`] with `physical` and the remapping lock held:
+/// `pages` (`None` unmaps) at `base`; false if a page or the host fails.
+fn map_pages(physical: &mut Physical, base: usize, n: usize, pages: Option<&[usize]>) -> bool {
+    unmap(physical, base, n * PAGE);
+    let Some(pages) = pages else {
+        return true;
+    };
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
             tracing::warn!(page = pages[i], "XMemMapPhysicalPages: unknown page");
-            return std::ptr::null_mut();
+            return false;
         };
         // One view per run of consecutive slices of one section.
         let run = 1 + pages[i + 1..]
@@ -626,12 +635,12 @@ pub extern "system" fn XMemMapPhysicalPages(
                 })
             })
             .count();
-        if !map(&mut physical, base + i * PAGE, run * PAGE, first) {
-            return std::ptr::null_mut();
+        if !map(physical, base + i * PAGE, run * PAGE, first) {
+            return false;
         }
         i += run;
     }
-    address
+    true
 }
 
 /// One page at each address; null `pages`, or a page number 0, unmaps
@@ -644,6 +653,14 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
     if addresses.is_null() {
         return 0;
     }
+    scatter(addresses, n, pages, victory_gpu::resource::remap_batch())
+}
+
+/// [`XMemMapPhysicalPagesScatter`]; `batch`: every page under one hold of
+/// `physical` and the remapping lock, taken in that order as everywhere
+/// (`victory_gpu::resource::remap_batch`), not one per page.
+fn scatter(addresses: *const *mut c_void, n: usize, pages: *const usize, batch: bool) -> BOOL {
+    let mut held = batch.then(|| (physical(), victory_gpu::title_memory_remapping()));
     for i in 0..n {
         // SAFETY: the title passes `n` addresses and, unless null, `n` pages.
         let (address, page) = unsafe {
@@ -656,7 +673,15 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
                 },
             )
         };
-        if XMemMapPhysicalPages(address, 1, page).is_null() {
+        let ok = match &mut held {
+            Some((physical, _)) => {
+                // SAFETY: one page number when not null.
+                let page = (!page.is_null()).then(|| unsafe { std::slice::from_raw_parts(page, 1) });
+                map_pages(physical, address as usize, 1, page)
+            }
+            None => !XMemMapPhysicalPages(address, 1, page).is_null(),
+        };
+        if !ok {
             return 0;
         }
     }
@@ -669,11 +694,26 @@ pub extern "system" fn XMemMapPhysicalPagesScatter(
 /// the title maps pages into a pool view, then has the GPU map them into its tiled
 /// heap. Page by page; false if a source page is not mapped physical memory.
 pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
-    let (to, from, len) = (to as usize, from as usize, len as usize);
     let mut physical = physical();
     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
     let _changing = victory_gpu::title_memory_remapping();
-    unmap(&mut physical, to, len);
+    alias(&mut physical, to, from, len)
+}
+
+/// Several [`map_alias`] in order, under one hold of `physical` and the
+/// remapping lock (`victory_gpu::resource::remap_batch`: a page-mapping
+/// copy's ranges); false if any failed, the others are still made.
+pub fn map_aliases(ops: &[(u64, u64, u64)]) -> bool {
+    let mut physical = physical();
+    let _changing = victory_gpu::title_memory_remapping();
+    ops.iter()
+        .fold(true, |ok, &(to, from, len)| alias(&mut physical, to, from, len) & ok)
+}
+
+/// [`map_alias`] with `physical` and the remapping lock held.
+fn alias(physical: &mut Physical, to: u64, from: u64, len: u64) -> bool {
+    let (to, from, len) = (to as usize, from as usize, len as usize);
+    unmap(physical, to, len);
     for k in (0..len).step_by(PAGE) {
         if from == 0 {
             break;
@@ -691,7 +731,7 @@ pub fn map_alias(to: u64, from: u64, len: u64) -> bool {
         else {
             return false;
         };
-        if !map(&mut physical, to + k, PAGE, slice) {
+        if !map(physical, to + k, PAGE, slice) {
             return false;
         }
     }
@@ -1141,6 +1181,70 @@ mod tests {
         assert!(!map_alias(b as u64, at(a, 1) as u64, PAGE as u64));
         assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
         assert_eq!(XMemIsToolsMemAvailable(), 0);
+    }
+
+    /// Batched (`VICTORY_REMAP_BATCH`), a scatter call's pages and a
+    /// page-mapping copy's ranges map, unmap and fail as one by one.
+    #[test]
+    fn batched_scatters_and_aliases_map_as_one_by_one() {
+        let mut pages = [0usize; 2];
+        let mut n = 2;
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut n, pages.as_mut_ptr()), 1);
+        let reserve = || {
+            XMemVirtualAlloc(
+                std::ptr::null_mut(),
+                3 * PAGE,
+                MEM_RESERVE | PAGES_64K,
+                0,
+                PAGE_READWRITE,
+            )
+        };
+        let (a, b, c) = (reserve(), reserve(), reserve());
+        assert!(!a.is_null() && !b.is_null() && !c.is_null());
+        let at = |p: *mut c_void, page: usize| p.wrapping_byte_add(page * PAGE);
+
+        // Batched: page 0 at `a`, page 1 at `a + 2 pages`.
+        let addresses = [a, at(a, 2)];
+        assert_eq!(scatter(addresses.as_ptr(), 2, pages.as_ptr(), true), 1);
+        // SAFETY: both mapped read-write.
+        unsafe {
+            a.cast::<u8>().write(5);
+            at(a, 2).cast::<u8>().write(6);
+        }
+        assert_eq!(query(at(a, 1)).host.State, MEM_RESERVE);
+        // One by one, the same pages at `b`: the same bytes.
+        let addresses = [b, at(b, 2)];
+        assert_eq!(scatter(addresses.as_ptr(), 2, pages.as_ptr(), false), 1);
+        // SAFETY: mapped read-write.
+        unsafe {
+            assert_eq!(b.cast::<u8>().read(), 5);
+            assert_eq!(at(b, 2).cast::<u8>().read(), 6);
+        }
+        // Batched, page number 0 unmaps.
+        let addresses = [at(b, 2)];
+        assert_eq!(scatter(addresses.as_ptr(), 1, [0usize].as_ptr(), true), 1);
+        assert_eq!(query(at(b, 2)).host.State, MEM_RESERVE);
+        // An unknown page fails batched as one by one.
+        let addresses = [at(c, 1)];
+        assert_eq!(scatter(addresses.as_ptr(), 1, [0x7ff0usize].as_ptr(), true), 0);
+        assert_eq!(scatter(addresses.as_ptr(), 1, [0x7ff0usize].as_ptr(), false), 0);
+
+        // A copy's ranges in one call: what `a` and `a + 2 pages` show, at
+        // `c` and `c + 1 page`; a failing range leaves the others made.
+        assert!(!map_aliases(&[
+            (c as u64, a as u64, PAGE as u64),
+            (at(c, 2) as u64, at(a, 1) as u64, PAGE as u64),
+            (at(c, 1) as u64, at(a, 2) as u64, PAGE as u64),
+        ]));
+        // SAFETY: mapped read-write.
+        unsafe {
+            assert_eq!(c.cast::<u8>().read(), 5);
+            assert_eq!(at(c, 1).cast::<u8>().read(), 6);
+        }
+        assert!(map_aliases(&[(c as u64, 0, 2 * PAGE as u64)]));
+        assert_eq!(query(c).host.State, MEM_RESERVE);
+        assert_eq!(query(at(c, 1)).host.State, MEM_RESERVE);
+        assert_eq!(XMemFreePhysicalPages(2, pages.as_ptr()), 1);
     }
 
     /// A thread that reads a mapped page in place, as the GPU side reads a
