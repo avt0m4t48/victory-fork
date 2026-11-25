@@ -123,14 +123,11 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
         return false;
     }
     // SAFETY: the title passes `planes` plane descriptions.
-    let Some(plane) = (unsafe { plane_parameters.as_ref() }) else {
+    let Some(resource) =
+        (unsafe { present_plane_resource(planes, plane_parameters, present_plane_override()) })
+    else {
         return false;
     };
-    if plane.count == 0 || plane.resources.is_null() {
-        return false;
-    }
-    // SAFETY: the plane lists `count` resources.
-    let resource = unsafe { *plane.resources };
     let Some(texture) = crate::resource::host_resource(resource) else {
         return false;
     };
@@ -857,6 +854,52 @@ pub(crate) struct Plane {
     count: u32,
     resources: *const This,
 }
+/// Byte stride of the title's full present-plane descriptor.
+#[cfg(any(windows, test))]
+const PRESENT_PLANE_STRIDE: usize = 0x48;
+
+#[cfg(windows)]
+fn present_plane_override() -> Option<&'static str> {
+    static OVERRIDE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| std::env::var("VICTORY_PRESENT_PLANE").ok())
+        .as_deref()
+}
+
+/// Selects the first resource of the requested zero-based plane.
+/// An absent, invalid, or out-of-range override uses plane zero.
+///
+/// # Safety
+/// Non-null `parameters` points to `planes` initialized descriptors at the
+/// title's stride. Each non-null resource list contains its declared count.
+#[cfg(any(windows, test))]
+unsafe fn present_plane_resource(
+    planes: u32,
+    parameters: *const Plane,
+    override_index: Option<&str>,
+) -> Option<This> {
+    if planes == 0 || parameters.is_null() {
+        return None;
+    }
+    let index = override_index
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|&index| index < planes)
+        .unwrap_or(0);
+    // SAFETY: the selected index is within the caller's descriptor range.
+    let plane = unsafe {
+        &*parameters
+            .cast::<u8>()
+            .add(index as usize * PRESENT_PLANE_STRIDE)
+            .cast::<Plane>()
+    };
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the caller supplies the plane's resource list.
+    let resource = unsafe { *plane.resources };
+    (!resource.is_null()).then_some(resource)
+}
+
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
@@ -1015,7 +1058,7 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the selected plane's first resource in our window.
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -1121,13 +1164,10 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
     }
     #[cfg(windows)]
     if !sent_behind
-        && planes > 0
         // SAFETY: the title passes `planes` plane descriptions.
-        && let Some(plane) = unsafe { plane_parameters.as_ref() }
-        && plane.count > 0
-        && !plane.resources.is_null()
-        // SAFETY: the plane lists `count` resources.
-        && let resource = unsafe { *plane.resources }
+        && let Some(resource) = unsafe {
+            present_plane_resource(planes, plane_parameters, present_plane_override())
+        }
         && let Some(texture) = crate::resource::host_resource(resource)
         && let Some(host) = crate::host::host()
     {
@@ -1435,5 +1475,57 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
+    }
+}
+#[cfg(test)]
+mod present_plane_tests {
+    use super::*;
+
+    #[repr(C)]
+    struct FixturePlane {
+        header: Plane,
+        tail: [u8; 0x48 - size_of::<Plane>()],
+    }
+
+    #[test]
+    fn selects_by_index_for_both_orders_and_equal_sizes() {
+        for (scene_size, hud_size) in [
+            ((3840, 2160), (1920, 1080)),
+            ((1920, 1080), (3840, 2160)),
+            ((1920, 1080), (1920, 1080)),
+        ] {
+            let scene = std::ptr::from_ref(&scene_size).cast();
+            let hud = std::ptr::from_ref(&hud_size).cast();
+            for resources in [[scene, hud], [hud, scene]] {
+                let planes = resources.each_ref().map(|resource| FixturePlane {
+                    header: Plane {
+                        token: 0,
+                        count: 1,
+                        resources: resource,
+                    },
+                    tail: [0; 0x48 - size_of::<Plane>()],
+                });
+                let parameters = planes.as_ptr().cast::<Plane>();
+                // SAFETY: both fixture headers are complete and 0x48 bytes apart.
+                unsafe {
+                    for fallback in [None, Some("0"), Some("2"), Some("-1"), Some("bad")] {
+                        assert_eq!(
+                            present_plane_resource(2, parameters, fallback),
+                            Some(resources[0])
+                        );
+                    }
+                    assert_eq!(
+                        present_plane_resource(2, parameters, Some("1")),
+                        Some(resources[1])
+                    );
+                    assert_eq!(
+                        present_plane_resource(1, parameters, Some("1")),
+                        Some(resources[0])
+                    );
+                    assert_eq!(present_plane_resource(0, parameters, Some("1")), None);
+                    assert_eq!(present_plane_resource(2, std::ptr::null(), Some("1")), None);
+                }
+            }
+        }
     }
 }
