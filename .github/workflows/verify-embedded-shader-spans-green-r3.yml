@@ -1,0 +1,45 @@
+name: Check embedded shader warm-up and exact cache hits on Windows
+on:
+  push:
+    branches: [verify/embedded-shader-spans-green-r3]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 16
+    env:
+      VICTORY_HOST_WAVE: '32'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm the exact production patch
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '5fa3a0c032906bb4247e3b2cfad2abeb2091b1d2') { throw 'Unexpected source revision' }
+          $actual=git diff --name-only HEAD^ HEAD
+          $expected=@('.github/scripts/build_embedded_fixture.py','.github/workflows/verify-embedded-shader-spans-green-r3.yml','apps/victory/tests/verify_embedded_cache.rs')
+          if (Compare-Object $expected $actual) { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Build two synthetic console containers
+        shell: pwsh
+        run: |
+          $env:VICTORY_EMBEDDED_FIXTURES = Join-Path $env:RUNNER_TEMP "embedded-fixtures"
+          "VICTORY_EMBEDDED_FIXTURES=$env:VICTORY_EMBEDDED_FIXTURES" | Out-File -Append $env:GITHUB_ENV
+          New-Item -Path $env:VICTORY_EMBEDDED_FIXTURES -ItemType Directory | Out-Null
+          Push-Location $env:VICTORY_EMBEDDED_FIXTURES
+          python "$env:GITHUB_WORKSPACE\.github\scripts\build_embedded_fixture.py"
+          Pop-Location
+      - name: Verify named warm-up and exact cache entries
+        run: cargo test --locked -p victory --test embedded_shader --test verify_embedded_cache -- --test-threads=1
+      - run: cargo test --locked -p victory-shader --lib dxbc::tests
+
+      - name: Check asset policy on the exact production commit
+        shell: pwsh
+        run: |
+          git checkout --detach HEAD^
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo run --locked --quiet --package xtask -- policy
