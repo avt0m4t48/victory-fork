@@ -1026,6 +1026,175 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn direct_mesh_tail_readback() {
+        use crate::host::{transition, warp_adapter};
+        use crate::object::{Object, This};
+        use victory_shader::emit::{HostShader, USER_GROUP_BASE, UserData};
+        use victory_shader::{HwStage, RootType};
+
+        let backend = std::env::var("MESH_PROBE_BACKEND").unwrap();
+        let Some(host) = host() else {
+            assert_eq!(backend, "hardware", "WARP device creation failed");
+            println!("SKIP hardware: no D3D12 device");
+            return;
+        };
+        let warp = unsafe { warp_adapter().unwrap().GetDesc().unwrap() };
+        let luid = unsafe { host.device.GetAdapterLuid() };
+        let is_warp = (luid.HighPart, luid.LowPart)
+            == (warp.AdapterLuid.HighPart, warp.AdapterLuid.LowPart);
+        if backend == "hardware" && is_warp {
+            println!("SKIP hardware: only WARP selected");
+            return;
+        }
+        assert_eq!(is_warp, backend != "hardware");
+        let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
+        let mut model = D3D12_FEATURE_DATA_SHADER_MODEL {
+            HighestShaderModel: D3D_SHADER_MODEL_6_6,
+        };
+        let (tier_result, model_result) = unsafe {
+            (
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_D3D12_OPTIONS7,
+                    (&raw mut options).cast(),
+                    size_of_val(&options) as u32,
+                ),
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_SHADER_MODEL,
+                    (&raw mut model).cast(),
+                    size_of_val(&model) as u32,
+                ),
+            )
+        };
+        println!("{backend}: adapter LUID {luid:?}, mesh tier {:?} ({tier_result:?}), shader model {:?} ({model_result:?})", options.MeshShaderTier, model.HighestShaderModel);
+        if !host.mesh_shaders() {
+            println!("SKIP {backend}: Victory requires mesh tier 1 and shader model 6.6");
+            return;
+        }
+
+        let dxc = dxc().expect("PC dxc.exe");
+        let dir = tempfile::tempdir().unwrap();
+        let split = victory_shader::emit::group_split_on();
+        for reads_x in [false, true] {
+            let signature = if reads_x {
+                "UAV(u0), RootConstants(num32BitConstants=1, b0)"
+            } else {
+                "UAV(u0)"
+            };
+            let group_arg = if reads_x { "uint3 group : SV_GroupID," } else { "" };
+            let count_tail = if reads_x {
+                "if (group.x + base >= 65535) counter.InterlockedAdd(4, 1);"
+            } else {
+                ""
+            };
+            let source = format!(r#"
+RWByteAddressBuffer counter : register(u0);
+cbuffer Piece : register(b0) {{ uint base; }}
+struct Vertex {{ float4 position : SV_Position; }};
+[RootSignature("{signature}")]
+[outputtopology("triangle")]
+[numthreads(1, 1, 1)]
+void main({group_arg} out vertices Vertex verts[3], out indices uint3 tris[1]) {{
+    SetMeshOutputCounts(0, 0);
+    counter.InterlockedAdd(0, 1);
+    {count_tail}
+}}
+"#);
+            let ms = compile(&dxc, dir.path(), &source, "ms_6_6");
+            let root = unsafe { host.device.CreateRootSignature(0, &ms).unwrap() };
+            let mut graphics = GraphicsState::default();
+            graphics.depth.DepthEnable = false.into();
+            let pso = mesh_pipeline(
+                &host.device, &root, code(&ms), code(&[]), &graphics, false, "direct mesh probe"
+            ).expect("mesh pipeline");
+            let stages = if reads_x {
+                let shader = super::super::shader("ms", b"direct mesh group-X fixture");
+                let translated = Translated {
+                    host: HostShader {
+                        stage: HwStage::Ms,
+                        dxil: ms,
+                        user_data: vec![UserData {
+                            index: 0,
+                            slot: 0,
+                            root: RootType::Other(USER_GROUP_BASE),
+                            dword: 0,
+                        }],
+                        samplers: vec![],
+                        static_samplers: vec![],
+                        root_cbvs: vec![],
+                        root_srvs: vec![],
+                        root_uavs: vec![],
+                        root_indexed_views: vec![],
+                    },
+                    used: vec![],
+                    stores: true,
+                };
+                assert!(shader.translated.set(Some(translated)).is_ok());
+                vec![Stage {
+                    shader,
+                    user_data: Some((1, 1)),
+                    root_cbvs: vec![],
+                    root_srvs: vec![],
+                    root_uavs: vec![],
+                }]
+            } else {
+                vec![]
+            };
+            let pipeline = super::super::Pipeline {
+                object: Object::new(&super::super::FUNCTIONS),
+                packet: [0; 8],
+                shaders: vec![],
+                bound: std::sync::atomic::AtomicBool::new(false),
+                host: Arc::new(super::super::make::Pending::for_dispatch_probe(HostPipeline {
+                    compute: false,
+                    mesh: true,
+                    pso,
+                    root,
+                    stages,
+                    slots: 0,
+                    inputs: vec![],
+                    rects: false,
+                    name: "direct mesh probe".into(),
+                    state: String::new(),
+                })),
+                builder: false,
+            };
+            let this: This = (&raw const pipeline).cast();
+            let mut state = crate::draw::State::default();
+            state.set_pipeline(this);
+            let list = host.new_list().unwrap();
+            let counter = host.uav_buffer(8).unwrap();
+            let (upload, initial) = host.upload_buffer(8).unwrap();
+            let readback = host.read_back_buffer(8).unwrap();
+            assert!(state.bind(&list, super::super::host_pipeline(this).unwrap(), false));
+            unsafe {
+                initial.cast::<[u32; 2]>().write([0; 2]);
+                list.list.ResourceBarrier(&[transition(&counter, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+                list.list.CopyBufferRegion(&counter, 0, &upload, 0, 8);
+                list.list.ResourceBarrier(&[transition(&counter, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+                list.list.SetGraphicsRootUnorderedAccessView(0, counter.GetGPUVirtualAddress());
+            }
+            state.dispatch_mesh(&list, 65_537);
+            unsafe {
+                list.list.ResourceBarrier(&[transition(&counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+                list.list.CopyBufferRegion(&readback, 0, &counter, 0, 8);
+            }
+            list.close();
+            host.execute(&[&list]);
+            let mut mapped = std::ptr::null_mut();
+            let counts = unsafe {
+                readback.Map(0, None, Some(&mut mapped)).unwrap();
+                let counts = mapped.cast::<[u32; 2]>().read();
+                readback.Unmap(0, None);
+                counts
+            };
+            let expected = [if split { 65_537 } else { 65_535 }, if split && reads_x { 2 } else { 0 }];
+            println!("{backend}: State::dispatch_mesh(65537), split={split}, group_x={reads_x}: [total, rebased_tail]={counts:?}, expected={expected:?}");
+            assert_eq!(counts, expected);
+        }
+    }
+
     /// A mesh pipeline made once is loaded from the library the next time,
     /// not compiled again (a stream without a topology never loads).
     #[test]

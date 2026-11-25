@@ -1,0 +1,61 @@
+name: Direct mesh dispatch GPU readback
+on:
+  push:
+    branches: [verify/direct-mesh-2e02245]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Apply the fixture to the exact candidate
+        shell: pwsh
+        run: |
+          $source = '2e0224543a7b656896e803ad566c7442ca95c7a8'
+          $patch = Join-Path $env:RUNNER_TEMP mesh.patch
+          git diff --binary --output="$patch" $source HEAD -- crates
+          git checkout --detach $source
+          if ($LASTEXITCODE -or (git rev-parse HEAD) -ne $source) { throw 'Wrong candidate' }
+          git apply "$patch"
+          if ($LASTEXITCODE) { throw 'Patch failed' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Run hardware, stock WARP, and pinned WARP probes
+        shell: pwsh
+        run: |
+          $build = cargo test -p victory-gpu --features diagnostics --lib --locked --no-run --message-format=json
+          if ($LASTEXITCODE) { throw 'Build failed' }
+          $exe = @($build | ConvertFrom-Json | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'victory_gpu' -and
+              $_.profile.test -and $_.executable
+          } | Select-Object -ExpandProperty executable)
+          if ($exe.Count -ne 1) { throw 'Expected exactly one GPU test binary' }
+          $exe = $exe[0]
+          $test = 'pipeline::host::tests::direct_mesh_tail_readback'
+          if ((& $exe --exact $test --list) -notcontains "${test}: test") { throw 'Missing probe' }
+          function Probe($backend) {
+            $env:MESH_PROBE_BACKEND = $backend
+            foreach ($split in '1', '0') {
+              $env:VICTORY_GROUP_SPLIT = $split
+              & $exe --exact $test --nocapture
+              if ($LASTEXITCODE) { throw "$backend split=$split failed" }
+            }
+          }
+          Probe 'hardware'
+          $env:VICTORY_D3D12_WARP = '1'
+          Probe 'stock WARP'
+          $version = '1.0.22'
+          $zip = Join-Path $env:RUNNER_TEMP warp.zip
+          $dir = Join-Path $env:RUNNER_TEMP warp
+          Invoke-WebRequest -Uri "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/$version/microsoft.direct3d.warp.$version.nupkg" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA512).Hash -ne '9b19c3cc108a3eacf0630c65bd61f21feaa348148f08379c1d55c8d205ec7ea1232181fec97f68617e9540256a8c4a50515b70ad018206bde156b4170d47d0d7') { throw 'WARP checksum mismatch' }
+          Expand-Archive $zip -DestinationPath $dir
+          $warp = Join-Path $dir 'build/native/bin/x64/d3d10warp.dll'
+          Write-Host "Pinned WARP DLL version $((Get-Item $warp).VersionInfo.FileVersion)"
+          Copy-Item $warp -Destination (Split-Path -Parent $exe)
+          Probe "WARP $version"
