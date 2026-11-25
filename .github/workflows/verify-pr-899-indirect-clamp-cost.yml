@@ -1,0 +1,34 @@
+name: Indirect clamp cost by record count
+on:
+  push:
+    branches: [verify/pr-899-indirect-clamp-cost]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm the PR source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne '684eb7aa53cdedf7d42782e9f998c109d07d423f') { throw 'Unexpected PR head' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-gpu/src/indirect/bench.rs') { throw 'Unexpected probe changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Measure the same clamps and draw workload
+        shell: pwsh
+        run: |
+          $output = & cargo test --release --locked -p victory-gpu --features diagnostics --lib bench_indirect_draw_barriers -- --ignored --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output -join ' '
+          if ($code -ne 0 -or $log -notmatch 'Microsoft Basic Render Driver' -or $log -notmatch '512 records ordered +GPU' -or $log -notmatch '1 passed; 0 failed') {
+            throw 'The benchmark did not produce all WARP rows'
+          }
