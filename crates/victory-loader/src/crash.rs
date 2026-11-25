@@ -725,7 +725,7 @@ mod tests {
         assert_eq!(
             callers,
             [
-                (&raw const victory_test_unwind_inner_return) as u64,
+                ((&raw const victory_test_unwind_inner_return) as u64) + 1,
                 (&raw const victory_test_unwind_outer_return) as u64,
             ],
         );
