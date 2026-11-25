@@ -1635,6 +1635,15 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
 /// moves no halves names nothing.
 #[test]
 fn halves_go_through_a_table_as_they_are_and_name_their_views() {
+    check_d16_table_views(0);
+}
+
+#[test]
+fn d16_load_names_the_descriptor_used_inside_a_table_range() {
+    check_d16_table_views(0x20);
+}
+
+fn check_d16_table_views(input_offset: u32) {
     use super::host::Stride;
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_UINT;
     /// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0 idxen`.
@@ -1647,12 +1656,14 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
     const LOAD_D16_XYZW: u32 = 0x83;
     const STORE_D16_XYZW: u32 = 0x87;
     const THREADS: u32 = 32;
-    // The table's second descriptor, 0x20 bytes on.
-    let mut second = s_load_dwordx4(12, 4);
-    second[1] |= 0x20;
+    let output_offset = input_offset + 0x20;
+    let mut input = s_load_dwordx4(8, 4);
+    input[1] |= input_offset;
+    let mut output = s_load_dwordx4(12, 4);
+    output[1] |= output_offset;
     let mut words = vec![s_mov_b32(5, 0x80)];
-    words.extend_from_slice(&s_load_dwordx4(8, 4));
-    words.extend_from_slice(&second);
+    words.extend_from_slice(&input);
+    words.extend_from_slice(&output);
     // v[1:2] = first[thread] (four halves), second[thread] = v[1:2].
     words.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
     words.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
@@ -1689,7 +1700,10 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
                 slot: 1,
             },
         ],
-        used: vec![view(ResourceType::Srv, 0), view(ResourceType::Uav, 8)],
+        used: vec![
+            view(ResourceType::Srv, 0),
+            view(ResourceType::Uav, output_offset / 4),
+        ],
         io: StageIo::Cs(ComputeIo {
             rsrc2: 5 << 1,
             threads: [THREADS, 1, 1],
@@ -1713,7 +1727,11 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         mesh_stride: 0,
     })
     .expect("lower");
-    assert_eq!(lowered.half_views, [(1, 0), (1, 8)]);
+    assert_eq!(
+        lowered.half_views,
+        [(1, input_offset / 4), (1, output_offset / 4)],
+        "report the descriptor accessed by the shader at each table offset"
+    );
     let shader = HostShader {
         stage: HwStage::Cs,
         dxil: lowered.dxil,
@@ -1750,6 +1768,14 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
         .chunks(2)
         .map(|pair| u32::from(pair[0]) | u32::from(pair[1]) << 16)
         .collect();
+    let zeroes = vec![0; data.len()];
+    let stride = Stride::Format(DXGI_FORMAT_R16G16B16A16_UINT, 8);
+    let mut views = vec![
+        View::Buffer { data: &zeroes, stride };
+        (input_offset / 32) as usize
+    ];
+    views.push(View::Buffer { data: &data, stride });
+    views.push(View::HalfUintUav(THREADS));
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut ran = 0;
     for (label, warp) in [("hardware", false), ("warp", true)] {
@@ -1773,13 +1799,7 @@ fn halves_go_through_a_table_as_they_are_and_name_their_views() {
                 &pso,
                 &Dispatch {
                     roots: vec![(0, Root::Constants(ud))],
-                    views: &[
-                        View::Buffer {
-                            data: &data,
-                            stride: Stride::Format(DXGI_FORMAT_R16G16B16A16_UINT, 8),
-                        },
-                        View::HalfUintUav(THREADS),
-                    ],
+                    views: &views,
                     samplers: &[],
                     groups: [1, 1, 1],
                 },
