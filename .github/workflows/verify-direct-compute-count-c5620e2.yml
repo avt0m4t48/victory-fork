@@ -1,0 +1,53 @@
+name: Direct compute group count on Windows WARP
+on:
+  push:
+    branches: [verify/direct-compute-count-c5620e2-173113]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: candidate
+            source: c5620e2a648a10db76e1255ee556c06001f4c313
+            enabled: '65537'
+          - name: parent
+            source: 1ae3e333b686547137dc7320b267e7093d886f3d
+            enabled: '65535'
+    name: WARP / ${{ matrix.name }}
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 4
+      - name: Apply only the test fixture to the exact source commit
+        shell: pwsh
+        run: |
+          $fixture = Join-Path $env:RUNNER_TEMP direct-compute-fixture.patch
+          git diff --binary --output="$fixture" HEAD~2 HEAD^
+          if ($LASTEXITCODE) { throw 'Fixture export failed' }
+          git checkout --detach ${{ matrix.source }}
+          if ($LASTEXITCODE -or (git rev-parse HEAD) -ne '${{ matrix.source }}') { throw 'Wrong source commit' }
+          git apply --check "$fixture"
+          if ($LASTEXITCODE) { throw 'Fixture does not apply' }
+          git apply "$fixture"
+          if ($LASTEXITCODE) { throw 'Fixture apply failed' }
+          git status --short
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Split enabled
+        env:
+          VICTORY_GROUP_SPLIT: '1'
+          EXPECTED_DIRECT_GROUPS: ${{ matrix.enabled }}
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib pipeline::tests::warp_direct_compute_group_count_without_group_x -- --exact --nocapture
+      - name: Split disabled control
+        env:
+          VICTORY_GROUP_SPLIT: '0'
+          EXPECTED_DIRECT_GROUPS: '65535'
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib pipeline::tests::warp_direct_compute_group_count_without_group_x -- --exact --nocapture
