@@ -41,6 +41,8 @@ jobs:
           git switch --detach ${{ matrix.revision }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git rev-parse HEAD
+          git restore --source=1090299599e2de9750156e63269e48982382687c -- Cargo.lock apps/victory/Cargo.toml
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           New-Item -ItemType Directory -Force (Split-Path $fixture) | Out-Null
           $source = Get-Content -Raw $temp
           $source.Replace('    String::from_utf8(result.stdout).unwrap()', '    let stdout = String::from_utf8(result.stdout).unwrap(); println!("{stdout}"); stdout') | Set-Content $fixture
@@ -62,3 +64,4 @@ jobs:
               throw "Unexpected fixture outcome"
             }
           }
+          exit 0
