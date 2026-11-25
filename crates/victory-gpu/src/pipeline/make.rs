@@ -45,6 +45,9 @@ pub(crate) struct Pending {
     /// A compute program big enough that the host driver takes seconds to
     /// compile it ([`big_bytes`]).
     big: bool,
+    /// The same pipeline made for other render target formats
+    /// ([`for_targets`]); never removed while this one lives.
+    variants: Mutex<Vec<Arc<Pending>>>,
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -70,6 +73,7 @@ impl Pending {
             key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
             big,
+            variants: Mutex::new(Vec::new()),
         }
     }
 
@@ -143,6 +147,54 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     }
     p.made.get()?.as_ref()
 }
+
+/// The render target formats `p` was made for (graphics pipelines).
+pub(crate) fn targets(
+    p: &Pending,
+) -> Option<windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY> {
+    p.graphics.as_ref().map(|g| g.targets)
+}
+
+/// `p` made for render targets of `targets` instead of the formats the
+/// title named, made by the workers like any first use (and waited for
+/// within the frame's budget); `None` while it is being made or if the host
+/// refuses it. Each set of formats is made once per pipeline.
+pub(crate) fn for_targets<'a>(
+    p: &'a Pending,
+    targets: windows::Win32::Graphics::Direct3D12::D3D12_RT_FORMAT_ARRAY,
+) -> Option<&'a HostPipeline> {
+    let g = p.graphics.as_deref()?;
+    let variant = {
+        let mut variants = p.variants.lock().unwrap_or_else(|e| e.into_inner());
+        match variants
+            .iter()
+            .find(|v| v.graphics.as_ref().is_some_and(|vg| vg.targets == targets))
+        {
+            Some(v) => v.clone(),
+            None => {
+                let v = Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_targets(targets)))));
+                variants.push(v.clone());
+                static SAID: std::sync::Once = std::sync::Once::new();
+                SAID.call_once(|| {
+                    tracing::info!(
+                        title = ?&g.targets.RTFormats[..g.targets.NumRenderTargets as usize],
+                        bound = ?&targets.RTFormats[..targets.NumRenderTargets as usize],
+                        "a pipeline is made again for the formats of the targets bound to it (VICTORY_TARGET_VARIANTS=0: draw with the title's)"
+                    );
+                });
+                VARIANTS.fetch_add(1, Ordering::Relaxed);
+                v
+            }
+        }
+    };
+    let made = ready(&variant)?;
+    // SAFETY: the variant lives in `p.variants`, which only grows and lives
+    // as long as `p`, so what it made outlives this borrow of `p`.
+    Some(unsafe { &*std::ptr::from_ref(made) })
+}
+
+/// Pipelines made again for their bound targets' formats, since the start.
+pub(crate) static VARIANTS: AtomicU64 = AtomicU64::new(0);
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
 /// that is making it); whether it has a host pipeline.

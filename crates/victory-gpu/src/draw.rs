@@ -196,6 +196,10 @@ pub(crate) struct State {
     index: IndexView,
     /// Bound render target and depth resources, for their host states.
     targets: Vec<usize>,
+    /// The format of the view bound in each render target slot, as the host
+    /// made it (`UNKNOWN` where none is), for pipelines made for other
+    /// formats ([`crate::pipeline::host_pipeline_for_targets`]).
+    target_formats: [DXGI_FORMAT; 8],
     depth: usize,
     /// The host state the bound depth view needs ([`depth_state`]).
     depth_state: u32,
@@ -583,6 +587,7 @@ impl State {
         self.depth_handle = depth;
         self.targets_set = true;
         self.targets.clear();
+        self.target_formats = Default::default();
         let mut rtvs = Vec::new();
         for &h in handles {
             let Some(record) = crate::descriptor::rtv_record(h) else {
@@ -603,6 +608,9 @@ impl State {
                     .desc()
                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
                 if let Some(desc) = null {
+                    if let Some(slot) = self.target_formats.get_mut(rtvs.len()) {
+                        *slot = desc.Format;
+                    }
                     rtvs.push(host.rtv(None, Some(&desc)));
                 }
                 continue;
@@ -610,7 +618,14 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
-            rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+            let desc = record.desc();
+            if let Some(slot) = self.target_formats.get_mut(rtvs.len()) {
+                // The view's format, else the texture's own (a view without
+                // a description).
+                // SAFETY: a live resource.
+                *slot = desc.as_ref().map_or_else(|| unsafe { texture.GetDesc() }.Format, |d| d.Format);
+            }
+            rtvs.push(host.rtv(Some(texture), desc.as_ref()));
         }
         self.depth = 0;
         self.depth_state = DEPTH_WRITE;
@@ -873,6 +888,9 @@ impl State {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
             return false;
         }
+        // Made again for the bound targets' formats if they are not the ones
+        // the pipeline names (the console writes the surface's own format).
+        let p = crate::pipeline::host_pipeline_for_targets(self.pipeline as This, p, &self.target_formats);
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
             once!("a rectangle pipeline drawn with another topology");

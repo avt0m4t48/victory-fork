@@ -110,6 +110,38 @@ fn integer_format(f: DXGI_FORMAT) -> bool {
 }
 
 impl GraphicsState {
+    /// The same state for render targets of `targets` (a variant for a draw
+    /// whose bound targets are not in the formats the title's pipeline names:
+    /// the console's colour blocks write the surface's own format, the host
+    /// leaves such draws undefined). The input elements point into the copy's
+    /// own names.
+    pub(crate) fn with_targets(&self, targets: D3D12_RT_FORMAT_ARRAY) -> GraphicsState {
+        let names = self.names.clone();
+        let inputs = self
+            .inputs
+            .iter()
+            .zip(&names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                ..*e
+            })
+            .collect();
+        GraphicsState {
+            blend: self.blend,
+            sample_mask: self.sample_mask,
+            rasterizer: self.rasterizer,
+            depth: self.depth,
+            depth_bounds: self.depth_bounds,
+            inputs,
+            names,
+            strip_cut: self.strip_cut,
+            topology: self.topology,
+            targets,
+            depth_format: self.depth_format,
+            samples: self.samples,
+        }
+    }
+
     /// The blend state for the host: as the title gave it, with blending and
     /// logic operations off for integer targets, as the console does (one
     /// target's description is copied to all first if the title's applies to
@@ -249,7 +281,10 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            // (the host's: a pipeline whose blend state the host changes
+            // gets another key in the library than the one it was refused or
+            // made as before)
+            self.host_blend(),
             self.sample_mask,
             self.rasterizer,
             self.depth,

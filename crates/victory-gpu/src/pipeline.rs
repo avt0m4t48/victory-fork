@@ -426,6 +426,44 @@ pub(crate) fn host_pipeline<'a>(this: This) -> Option<&'a host::HostPipeline> {
     make::ready(&pipeline(this).host)
 }
 
+/// The host pipeline of title pipeline `this` for a draw whose bound render
+/// targets are in `bound` (format per slot, `UNKNOWN` where none is bound):
+/// the pipeline itself when every target the pipeline names is bound in the
+/// format it names, else the pipeline made again with the bound formats in
+/// those slots ([`make::for_targets`]); while that is being made, the
+/// title's own. `VICTORY_TARGET_VARIANTS=0`: always the title's own.
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for_targets<'a>(
+    this: This,
+    own: &'a host::HostPipeline,
+    bound: &[windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT; 8],
+) -> &'a host::HostPipeline {
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_UNKNOWN;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if own.compute
+        || this.is_null()
+        || !*ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
+    {
+        return own;
+    }
+    let p = &pipeline(this).host;
+    let Some(mut targets) = make::targets(p) else {
+        return own;
+    };
+    let count = (targets.NumRenderTargets as usize).min(8);
+    let mut differs = false;
+    for (named, &bound) in targets.RTFormats[..count].iter_mut().zip(bound) {
+        if *named != DXGI_FORMAT_UNKNOWN && bound != DXGI_FORMAT_UNKNOWN && *named != bound {
+            *named = bound;
+            differs = true;
+        }
+    }
+    if !differs {
+        return own;
+    }
+    make::for_targets(p, targets).unwrap_or(own)
+}
+
 /// Host pipelines queued and not made yet.
 #[cfg(windows)]
 pub(crate) fn making() -> u64 {
