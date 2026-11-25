@@ -3515,10 +3515,11 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
-        // Collect the back ranges before consuming `items`: `copy_back_done`
-        // must run after `line.written` is updated and waiters are woken, so
-        // no other thread can see a range as free while its merge is still in
-        // flight (the race behind the loading-time 0xc0000005 crashes).
+        // Collect each flight's back ranges before consuming `items` (without
+        // deduplicating across flights: `Shadow::copy_back_done` decrements
+        // `Flights` per flight!). Calling `copy_back_done` after `line.written`
+        // is updated and waiters are woken ensures no concurrent refresh sees a
+        // range as free while its merge is still in flight.
         let mut backs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for item in items {
             match item {
@@ -3531,18 +3532,7 @@ impl Host {
                         self.card_done(card);
                     }
                     landed.push((flight.lists, flight.order));
-                    for (shadow, ranges) in &flight.back {
-                        match backs.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
-                            Some((_, all)) => {
-                                for range in ranges {
-                                    if !all.contains(range) {
-                                        all.push(*range);
-                                    }
-                                }
-                            }
-                            None => backs.push((shadow.clone(), ranges.clone())),
-                        }
-                    }
+                    backs.extend(flight.back);
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
