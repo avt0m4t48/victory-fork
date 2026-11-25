@@ -24,6 +24,8 @@ pub mod console;
 mod copystat;
 pub mod descriptor;
 pub mod device;
+#[cfg(any(windows, test))]
+mod dispatch_groups;
 #[cfg(windows)]
 mod drvwatch;
 #[cfg(windows)]

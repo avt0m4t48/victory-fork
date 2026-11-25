@@ -2039,11 +2039,6 @@ impl State {
         });
     }
 
-    /// The most groups the host runs in one dimension of a dispatch. The
-    /// console's own limit is higher (a builder pass asks for 77,500 in
-    /// `x`): a dispatch beyond it is run as several ([`State::dispatch`]).
-    const MOST_GROUPS: u32 = 65_535;
-
     /// Where a compute or mesh stage's group-ID base is bound, if the stage
     /// reads its group id: its user-data root parameter and the dword in it
     /// (`victory_shader::emit::USER_GROUP_BASE`).
@@ -2065,16 +2060,43 @@ impl State {
         None
     }
 
-    /// Sets the group-ID base of the next run of a split dispatch.
-    fn set_group_base(list: &HostList, compute: bool, (param, dword): (u32, u32), base: u32) {
-        // SAFETY: an open list whose root signature has that parameter.
-        unsafe {
-            if compute {
-                list.list.SetComputeRoot32BitConstant(param, base, dword);
+    /// Splits a direct dispatch along X and binds each nonzero base when the shader uses it.
+    fn dispatch_x_groups(
+        list: &HostList,
+        compute: bool,
+        p: Option<&HostPipeline>,
+        x: u32,
+        mut dispatch: impl FnMut(u32),
+    ) {
+        use crate::dispatch_groups::{MAX_GROUPS, dispatch_groups};
+
+        let split = victory_shader::emit::group_split_on();
+        let mut slot = None;
+        if x > MAX_GROUPS {
+            if split {
+                slot = p.and_then(Self::group_base_slot);
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(compute, x, runs = x.div_ceil(MAX_GROUPS), "splitting an oversized direct dispatch");
+                });
             } else {
-                list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+                once!(compute, x, "clamping an oversized direct dispatch (VICTORY_GROUP_SPLIT=0)");
             }
         }
+
+        dispatch_groups(x, split, slot, |count, binding| {
+            if let Some(((param, dword), base)) = binding {
+                // SAFETY: an open list whose root signature has that parameter.
+                unsafe {
+                    if compute {
+                        list.list.SetComputeRoot32BitConstant(param, base, dword);
+                    } else {
+                        list.list.SetGraphicsRoot32BitConstant(param, base, dword);
+                    }
+                }
+            }
+            dispatch(count);
+        });
     }
 
     /// Runs a dispatch on the host.
@@ -2131,47 +2153,10 @@ impl State {
         }
         #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
-        // The host runs at most 65,535 groups in a dimension. A console
-        // dispatch over that runs as several, each with the group id where
-        // it starts (the translated program adds
-        // `victory_shader::emit::USER_GROUP_BASE` to its group id).
-        match Self::group_base_slot(p) {
-            Some(slot) if x > Self::MOST_GROUPS => {
-                static ONCE: std::sync::Once = std::sync::Once::new();
-                ONCE.call_once(|| {
-                    tracing::info!(
-                        x,
-                        runs = x.div_ceil(Self::MOST_GROUPS),
-                        "a dispatch asks for more groups in x than the host runs: it runs in pieces, each told where its \
-                         groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
-                    );
-                });
-                let mut at = 0;
-                while at < x {
-                    let n = (x - at).min(Self::MOST_GROUPS);
-                    if at != 0 {
-                        Self::set_group_base(list, true, slot, at);
-                    }
-                    // SAFETY: an open list with everything set.
-                    unsafe { list.list.Dispatch(n, y, z) };
-                    at += n;
-                }
-            }
-            _ => {
-                if x > Self::MOST_GROUPS {
-                    once!(
-                        x,
-                        "a dispatch asks for more groups in x than the host runs and its program reads no group id: the \
-                         groups after 65,535 do not run"
-                    );
-                }
-                // No group id to move: the groups after the host's limit
-                // cannot be run at all (a count over it the host does not
-                // give its driver either).
-                // SAFETY: an open list with everything set.
-                unsafe { list.list.Dispatch(x.min(Self::MOST_GROUPS), y, z) };
-            }
-        }
+        Self::dispatch_x_groups(list, true, Some(p), x, |count| {
+            // SAFETY: an open list with everything set.
+            unsafe { list.list.Dispatch(count, y, z) };
+        });
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -2440,47 +2425,11 @@ impl State {
                     #[cfg(feature = "diagnostics")]
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
-                    // As a dispatch (see `State::dispatch`): more groups in x
-                    // than the host runs go in pieces, each told where its
-                    // groups start.
-                    let slot = crate::pipeline::host_pipeline(self.pipeline as This).and_then(Self::group_base_slot);
-                    match slot {
-                        Some(slot) if x > Self::MOST_GROUPS => {
-                            static ONCE: std::sync::Once = std::sync::Once::new();
-                            ONCE.call_once(|| {
-                                tracing::info!(
-                                    x,
-                                    runs = x.div_ceil(Self::MOST_GROUPS),
-                                    "a mesh dispatch asks for more groups in x than the host runs: it runs in pieces, each \
-                                     told where its groups start (VICTORY_GROUP_SPLIT=0: the first 65,535 groups only)"
-                                );
-                            });
-                            let mut at = 0;
-                            while at < x {
-                                let n = (x - at).min(Self::MOST_GROUPS);
-                                if at != 0 {
-                                    Self::set_group_base(list, false, slot, at);
-                                }
-                                // SAFETY: an open list with everything set.
-                                unsafe { l6.DispatchMesh(n, 1, 1) };
-                                at += n;
-                            }
-                        }
-                        _ => {
-                            if x > Self::MOST_GROUPS {
-                                once!(
-                                    x,
-                                    "a mesh dispatch asks for more groups in x than the host runs and its program reads no \
-                                     group id: the groups after 65,535 do not run"
-                                );
-                            }
-                            // As above: no group id to move, and a count
-                            // over the limit the host does not hand its
-                            // driver either.
-                            // SAFETY: an open list with everything set.
-                            unsafe { l6.DispatchMesh(x.min(Self::MOST_GROUPS), 1, 1) };
-                        }
-                    }
+                    let p = crate::pipeline::host_pipeline(self.pipeline as This);
+                    Self::dispatch_x_groups(list, false, p, x, |count| {
+                        // SAFETY: an open list with everything set.
+                        unsafe { l6.DispatchMesh(count, 1, 1) };
+                    });
                     self.mesh_scissor(list, false);
                     DRAWN.fetch_add(1, Ordering::Relaxed);
                     true
