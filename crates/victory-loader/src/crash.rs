@@ -661,30 +661,74 @@ fn memory_at(address: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use windows_sys::Win32::System::Diagnostics::Debug::{
-        EXCEPTION_RECORD, RtlCaptureContext, RtlCaptureStackBackTrace,
-    };
+    use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD, RtlCaptureContext};
+
+    // Two Win64 non-leaf frames with explicit unwind records and named return
+    // addresses. Each reserves 32 bytes of shadow space and aligns RSP for its call.
+    // Each return label precedes the epilogue so the walker uses the unwind record.
+    std::arch::global_asm!(
+        ".text",
+        ".globl victory_test_unwind_outer",
+        ".globl victory_test_unwind_outer_return",
+        ".globl victory_test_unwind_inner_return",
+        ".seh_proc victory_test_unwind_outer",
+        "victory_test_unwind_outer:",
+        "sub rsp, 40",
+        ".seh_stackalloc 40",
+        ".seh_endprologue",
+        "call victory_test_unwind_inner",
+        "victory_test_unwind_outer_return:",
+        "nop",
+        "add rsp, 40",
+        "ret",
+        ".seh_endproc",
+        ".seh_proc victory_test_unwind_inner",
+        "victory_test_unwind_inner:",
+        "sub rsp, 40",
+        ".seh_stackalloc 40",
+        ".seh_endprologue",
+        "call rdx",
+        "victory_test_unwind_inner_return:",
+        "nop",
+        "add rsp, 40",
+        "ret",
+        ".seh_endproc",
+    );
+
+    unsafe extern "system" {
+        fn victory_test_unwind_outer(
+            callers: &mut [u64; 2],
+            capture: extern "system" fn(&mut [u64; 2]),
+        );
+        static victory_test_unwind_inner_return: u8;
+        static victory_test_unwind_outer_return: u8;
+    }
 
     #[test]
-    #[inline(never)]
-    fn unwinds_like_the_system_walk() {
-        // SAFETY: zeroed CONTEXT is valid; both calls write our buffers.
-        let (frames, walked) = unsafe {
-            // `RtlCaptureContext` wants it 16-byte aligned too.
-            let mut context = Aligned16(std::mem::zeroed());
-            RtlCaptureContext(&mut context.0);
-            let mut walked = [null_mut(); 8];
-            let n = RtlCaptureStackBackTrace(0, 8, walked.as_mut_ptr(), null_mut());
-            (unwind(context.0), walked[..usize::from(n)].to_vec())
-        };
-        // Frame 0 differs (two call sites in this function); callers agree.
-        assert!(walked.len() >= 4, "{walked:?}");
-        let ours: Vec<_> = frames[1..walked.len()]
-            .iter()
-            .map(|&f| f as usize)
-            .collect();
-        let system: Vec<_> = walked[1..].iter().map(|&f| f as usize).collect();
-        assert_eq!(ours, system);
+    fn unwinds_known_callers() {
+        extern "system" fn capture(callers: &mut [u64; 2]) {
+            // SAFETY: the zeroed CONTEXT is 16-byte aligned and writable.
+            let context = unsafe {
+                let mut context = Aligned16(std::mem::zeroed());
+                RtlCaptureContext(&mut context.0);
+                context.0
+            };
+            for (caller, pc) in callers.iter_mut().zip(unwind(context).into_iter().skip(1)) {
+                *caller = pc;
+            }
+        }
+
+        let mut callers = [0; 2];
+        // SAFETY: both assembly frames use the Win64 ABI and forward the
+        // caller buffer in RCX to the callback supplied in RDX.
+        unsafe { victory_test_unwind_outer(&mut callers, capture) };
+        assert_eq!(
+            callers,
+            [
+                (&raw const victory_test_unwind_inner_return) as u64,
+                (&raw const victory_test_unwind_outer_return) as u64,
+            ],
+        );
     }
 
     #[test]
