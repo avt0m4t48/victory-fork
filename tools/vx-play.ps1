@@ -8,6 +8,8 @@
 #   ... -SeriesS                 the Series S profile (its FSR4 upscaler does not run on NVIDIA yet)
 #   ... -NoSpeedSwitches         the fork's defaults instead of the settings below
 #   ... -NoWide                  without VICTORY_WAVE_WIDE_ONLY (faster, but unlit characters and rooms)
+#   ... -NoOverlay               without the status bar (tools\vx-overlay.py, needs Python 3 with Tk) that sits on
+#                                the game window's bottom edge and says WORKING (not frozen) when frames stall
 #   ... -Logs <folder>           where stdout/stderr go (default: .\runs)
 #
 # Keyboard is a pad while the window has focus: Enter = A, Backspace = B, W A S D = left stick,
@@ -20,10 +22,13 @@ param(
     [string]$Logs = (Join-Path (Get-Location) 'runs'),
     [switch]$SeriesS,
     [switch]$NoSpeedSwitches,
-    [switch]$NoWide
+    [switch]$NoWide,
+    [switch]$NoOverlay
 )
 if (-not (Test-Path $Exe)) { throw "no build at ${Exe}: cargo build --release -p victory" }
 if (-not (Test-Path $GameExe)) { throw "no title executable at ${GameExe}" }
+# Test and debug switches never carry into normal play (the idea of ztrx's launcher).
+foreach ($v in 'VICTORY_KEYS', 'VICTORY_CAPTURE', 'VICTORY_CAPTURE_FRAMES', 'VICTORY_DUMP_TARGETS', 'VICTORY_LOG') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 if (Test-Path $Config) { $env:VICTORY_CONFIG = (Resolve-Path $Config).Path }
 # textures the title rewrites through another mapping are hashed every frame while they change (no
 # startup flicker; ~5-7 ms/frame)
@@ -49,3 +54,9 @@ $tag = 'play-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 $p = Start-Process -FilePath $Exe -ArgumentList 'run', "`"$GameExe`"", '--execute', '--console', $console -RedirectStandardOutput (Join-Path $Logs "$tag-stdout.txt") -RedirectStandardError (Join-Path $Logs "$tag-stderr.txt") -PassThru
 "started ($console), pid $($p.Id); log: $(Join-Path $Logs "$tag-stderr.txt")"
+$overlay = Join-Path $PSScriptRoot 'vx-overlay.py'
+$pythonw = (Get-Command pythonw -ErrorAction SilentlyContinue).Source
+if (-not $NoOverlay -and $pythonw -and (Test-Path $overlay)) {
+    Start-Process -FilePath $pythonw -ArgumentList "`"$overlay`"", '--pid', $p.Id, '--log', "`"$(Join-Path $Logs "$tag-stderr.txt")`"" | Out-Null
+    'status bar: on (-NoOverlay to turn it off)'
+}

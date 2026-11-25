@@ -52,12 +52,51 @@ What vx-layer adds on top of the fork's commit 4e17478:
 
 `tools/vx-play.ps1` sets both switches.
 
-Known problems (open): walls are missing in some views and runs, some faces and
-clothing show blotchy or blocky patches, three compute programs (tiled
-volumetric light and alpha shadow cascades) still do not translate, two wave64
-compute programs with several console waves per thread group are still
-refused, many surfaces show little texture detail, and frames are slow
-(2-3 fps in gameplay).
+- **Faster loading: parallel file reads.** A DirectStorage file was one
+  synchronous handle, and reads through one synchronous handle wait for each
+  other whatever offsets they read, so the workers read one at a time: 9-11
+  workers busy reading at 77-136 MB/s from an NVMe drive, 6.3 ms per read,
+  with up to 1,200 requests queued (decompression took a twentieth of a
+  worker). Each read now borrows a handle of its own on the same file
+  (`ReOpenFile`): 0.47 ms per read, bursts of 589 MB/s, and the world was
+  reached in 76 s from launch instead of 94-217 s.
+- **Caches that survive.** Translated shaders were keyed by the hash of the
+  executable, so every rebuild started cold, and a cold translation cache gave
+  the worst stalls (frames of 2-9 s while the world loaded). They are now keyed
+  by a fingerprint of the translator's sources (`crates/victory-gpu/build.rs`),
+  plus what the host told the translator, so a rebuild that leaves the
+  translator alone keeps the cache, and diagnostics and plain builds share it
+  (`VICTORY_SHADER_CACHE_KEY=exe`: the old key). The pipeline library is no
+  longer saved under RenderDoc, whose stand-in library keeps no pipelines: its
+  32-byte save replaced a library of 355 MB, and the next run compiled some
+  1,400-2,500 pipelines again. A library the host refuses is set aside as
+  `host-pipelines.refused` instead of being overwritten.
+- **Status bar** (`tools/vx-overlay.py`, started by `tools/vx-play.ps1`): a
+  click-through bar on the game window's bottom edge with fps, shaders still
+  being built, cache hits, textures waiting, files loading, CPU and memory; it
+  says WORKING (not frozen) when no frame came for a few seconds, and what is
+  going on. Python 3 with Tk, standard library only.
+- **`examples/isa_dump`** prints a saved shader container's GFX10 program with
+  byte offsets, so a translator error's "GFX10 code at 0x..." can be read in
+  place.
+- Merged from [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+  (a803c87): textures picked by index are looked at again after their upload
+  (characters' skin and hair without colour in most launches before), double
+  precision wave sums, zlib-rs, a texture catch-up budget. The budget switches
+  are `VICTORY_TEXTURE_STAGE_MB/_MS` there; `VICTORY_HEAP_TEXTURE_MB/_MS` still
+  work here.
+
+Measured on an RTX 4090 with all of the above: about 385 ms per frame at
+4,000-7,000 draws (2.6 fps), seven-minute runs without errors.
+
+Known problems (open): walls are missing in some views and runs; some clothing
+shows blocky patches; one compute program (alpha shadow cascades) still does
+not translate; four wave64 compute programs are refused by NVIDIA's 32-lane
+limit (the tiled volumetric light pair, which translate since the merge, and
+two with several console waves per thread group); scene changes still stall for one to three
+seconds while the title loads; and frames are slow (2-3 fps in gameplay: the
+CPU's preparation, the wait for the card and the copy back run one after the
+other).
 
 Build: `cargo build --release -p victory`; run:
 `powershell -ExecutionPolicy Bypass -File tools\vx-play.ps1 -GameExe "<game folder>\<title exe>"`
