@@ -574,6 +574,74 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod direct_fence_probe {
+    use super::*;
+
+    pub(super) const MODE: &str = "VICTORY_TEST_DIRECT_FENCE_CHILD";
+
+    #[test]
+    fn synchronous_submit_checks_fence_waits_before_publishing_completion() {
+        if let Ok(mode) = std::env::var(MODE) {
+            on_failure(|message| {
+                assert_eq!(FINISHED.load(Ordering::Acquire), 0);
+                assert_eq!(STARTED.load(Ordering::Acquire), 1);
+                assert_eq!(unsafe { host().unwrap().fence.GetCompletedValue() }, 0);
+                eprintln!("reported direct fence failure before completion: {message}");
+                std::process::exit(42);
+            });
+            let host = host().expect("WARP device in the child process");
+            let first = host.new_list().unwrap();
+            let second = host.new_list().unwrap();
+            first.close();
+            second.close();
+            if mode.starts_with("healthy") {
+                host.execute(&[&first, &second]);
+                let expected = if mode == "healthy-grouped" { 2 } else { 1 };
+                assert_eq!(*host.submitted.lock().unwrap(), expected);
+                assert_eq!(unsafe { host.fence.GetCompletedValue() }, expected);
+                assert_eq!(FINISHED.load(Ordering::Acquire), 1);
+                eprintln!("published healthy completion after {expected} direct fence signals");
+                return;
+            }
+
+            // SAFETY: the unsignalled fence gates only this isolated queue.
+            let gate: ID3D12Fence =
+                unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+            host.execute(&[&first]);
+            panic!("submission returned despite injected {mode} failure");
+        }
+
+        let name = "host::direct_fence_probe::synchronous_submit_checks_fence_waits_before_publishing_completion";
+        for (mode, code, marker) in [
+            ("signal", 42, "could not signal a synchronous host submission"),
+            ("registration", 42, "could not register a synchronous host fence wait"),
+            ("wait", 42, "could not wait for a synchronous host submission"),
+            ("healthy", 0, "published healthy completion after 1 direct fence signals"),
+            ("healthy-grouped", 0, "published healthy completion after 2 direct fence signals"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", name, "--nocapture"])
+                .env(MODE, mode)
+                .env("VICTORY_D3D12_WARP", "1")
+                .env("VICTORY_LATE_WAIT", "0")
+                .env_remove("VICTORY_GPU_TIMING");
+            if mode == "healthy-grouped" {
+                child.env("VICTORY_GPU_TIMING", "1");
+            }
+            let output = child.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(code), "{mode}: {stderr}");
+            assert!(stderr.contains(marker), "{mode}: {stderr}");
+            if mode == "wait" {
+                assert!(stderr.contains("0x80070006"), "missing ERROR_INVALID_HANDLE: {stderr}");
+            }
+            eprintln!("{mode}: {stderr}");
+        }
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -5476,14 +5544,34 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                #[cfg(all(test, feature = "diagnostics"))]
+                let fault = std::env::var(direct_fence_probe::MODE).unwrap_or_default();
+                #[cfg(not(all(test, feature = "diagnostics")))]
+                let fault = "";
+                let signal = if fault == "signal" {
+                    Err(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+                } else {
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                if let Err(e) = signal {
                     fail(format_args!("could not signal a synchronous host submission ({e})"));
                 }
-                if let Err(e) = self.fence.SetEventOnCompletion(*submitted, self.event) {
+                let registration = if fault == "registration" {
+                    Err(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+                } else {
+                    self.fence.SetEventOnCompletion(*submitted, self.event)
+                };
+                if let Err(e) = registration {
                     fail(format_args!("could not register a synchronous host fence wait ({e})"));
                 }
                 working(false);
-                match WaitForSingleObject(self.event, INFINITE) {
+                let wait = if fault == "wait" {
+                    windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_INVALID_HANDLE);
+                    WAIT_FAILED
+                } else {
+                    WaitForSingleObject(self.event, INFINITE)
+                };
+                match wait {
                     WAIT_OBJECT_0 => {}
                     WAIT_FAILED => {
                         let error = windows::core::Error::from_thread();
