@@ -379,6 +379,27 @@ mod tests {
         assert!(slot.owned);
     }
 
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn a_grouped_empty_submission_signals_the_direct_queue() {
+        if std::env::var_os("VICTORY_GPU_TIMING").is_none() {
+            return;
+        }
+        let Some(host) = crate::host::host() else {
+            assert!(std::env::var_os("VICTORY_D3D12_WARP").is_none(), "a WARP host is required");
+            return;
+        };
+        // SAFETY: the direct queue's live fence; the submission waits for
+        // its own signal before returning.
+        let before = unsafe { host.completion_fence().GetCompletedValue() };
+        host.execute(&[]);
+        let after = unsafe { host.completion_fence().GetCompletedValue() };
+        assert!(
+            after != u64::MAX && after > before,
+            "an empty timed submission needs a new completion signal"
+        );
+    }
+
     #[test]
     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {
         assert_eq!(micros(1_000, 11_000, 10_000_000), 1_000);
