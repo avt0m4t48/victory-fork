@@ -1419,6 +1419,45 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_blocking_provider_initialization_clears_its_output() {
+        type Init = extern "system" fn(
+            This,
+            *const c_void,
+            *const c_char,
+            bool,
+            *mut *mut Provider,
+        ) -> HRESULT;
+
+        let init = method::<Init>(&OBJECT, 0x18);
+        let root = tempfile::tempdir().unwrap();
+        let previous = runtime::title();
+        runtime::set_title(runtime::Title {
+            storage: root.path().join("storage"),
+            ..Default::default()
+        });
+        let mut provider = std::ptr::null_mut();
+        assert_eq!(
+            init(&OBJECT, std::ptr::null(), c"scid".as_ptr(), false, &mut provider),
+            S_OK
+        );
+        assert!(!provider.is_null());
+
+        let blocked = root.path().join("ordinary-file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        runtime::set_title(runtime::Title {
+            storage: blocked.join("storage"),
+            ..Default::default()
+        });
+        let mut out = provider;
+        let status = init(&OBJECT, std::ptr::null(), c"scid".as_ptr(), false, &mut out);
+        runtime::set_title(previous);
+        close_provider(&OBJECT, provider);
+
+        assert_eq!(status, NO_ACCESS);
+        assert!(out.is_null(), "failure must clear the provider output");
+    }
+
+    #[test]
     fn blocking_and_prefix_methods_work() {
         let this: This = &OBJECT;
         type Init = extern "system" fn(
