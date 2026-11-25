@@ -63,6 +63,10 @@ pub(crate) struct Shader {
     container: Vec<u8>,
     #[cfg(windows)]
     translated: OnceLock<Option<Translated>>,
+    #[cfg(windows)]
+    mesh_over_budget: OnceLock<bool>,
+    #[cfg(windows)]
+    packed: OnceLock<Box<PackedTranslations>>,
 }
 
 impl std::fmt::Debug for Shader {
@@ -113,6 +117,10 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
                 container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
+                #[cfg(windows)]
+                mesh_over_budget: OnceLock::new(),
+                #[cfg(windows)]
+                packed: OnceLock::new(),
             })
         })
         .clone()
@@ -129,24 +137,77 @@ pub(crate) struct Translated {
 }
 
 #[cfg(windows)]
+type PackedTranslation = Arc<OnceLock<Option<Arc<Translated>>>>;
+#[cfg(windows)]
+type PackedTranslations = Mutex<HashMap<Vec<usize>, PackedTranslation>>;
+
+#[cfg(windows)]
 impl Shader {
+    fn mesh_over_budget(&self) -> bool {
+        *self
+            .mesh_over_budget
+            .get_or_init(|| victory_shader::emit::mesh_output_over_budget(&self.container))
+    }
+
+    fn packed_translation(
+        &self,
+        plan: &victory_shader::emit::PackedStage<'_>,
+    ) -> Option<Arc<Translated>> {
+        let variants = self.packed.get_or_init(|| Box::new(Mutex::new(HashMap::new())));
+        let entry = variants
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(plan.elements().to_vec())
+            .or_default()
+            .clone();
+        entry
+            .get_or_init(|| {
+                let done = translate_with(&self.container, || {
+                    crate::shader_cache::packed_host_shader(&self.container, plan)
+                });
+                if std::env::var_os("VICTORY_SHADER_SAVE").is_some() {
+                    let digest = crate::shader_cache::packing_fingerprint(&[0; 32], plan.elements());
+                    let hex = blake3::Hash::from_bytes(digest).to_hex();
+                    self.save_translation(&format!("-packed-{}", &hex[..16]), &done);
+                }
+                match done {
+                    Ok(t) => {
+                        KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        KEPT[3].fetch_add(
+                            t.host.dxil.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        Some(Arc::new(t))
+                    }
+                    Err(error) => {
+                        tracing::warn!(stage = self.stage, hash = %self.hash, %error, "packed mesh stage translation failed");
+                        None
+                    }
+                }
+            })
+            .clone()
+    }
+
+    /// Saves the guest container and the chosen host variant with separate names.
+    fn save_translation(&self, variant: &str, done: &Result<Translated, String>) {
+        if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let stem = format!("{}.{}{variant}", self.hash, self.stage);
+            let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
+            if let Ok(t) = done {
+                let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
+            }
+        }
+    }
+
     /// The translation, made on first use; a shader that does not
     /// translate is logged once.
     pub(crate) fn translated(&self) -> Option<&Translated> {
         self.translated
             .get_or_init(|| {
                 let done = translate(&self.container);
-                // `VICTORY_SHADER_SAVE=<dir>`: each shader as the title gave it (`.cdxil`) and as
-                // translated (`.dxil`), by the hash crash reports name it with
-                if let Some(dir) = std::env::var_os("VICTORY_SHADER_SAVE") {
-                    let dir = std::path::PathBuf::from(dir);
-                    let _ = std::fs::create_dir_all(&dir);
-                    let stem = format!("{}.{}", self.hash, self.stage);
-                    let _ = std::fs::write(dir.join(format!("{stem}.cdxil")), &self.container);
-                    if let Ok(t) = &done {
-                        let _ = std::fs::write(dir.join(format!("{stem}.dxil")), &t.host.dxil);
-                    }
-                }
+                self.save_translation("", &done);
                 if let Ok(t) = &done {
                     KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     KEPT[3].fetch_add(t.host.dxil.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -174,6 +235,14 @@ impl Shader {
 
 #[cfg(windows)]
 fn translate(container: &[u8]) -> Result<Translated, String> {
+    translate_with(container, || crate::shader_cache::host_shader(container))
+}
+
+#[cfg(windows)]
+fn translate_with(
+    container: &[u8],
+    host_shader: impl FnOnce() -> Result<victory_shader::emit::HostShader, String>,
+) -> Result<Translated, String> {
     use victory_shader::{Container, FourCC, HwStage};
     // The translation depends on it (a view index past a capped heap).
     crate::descriptor::host::probe_view_limit();
@@ -182,7 +251,7 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    let host = host_shader()?;
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()

@@ -9142,12 +9142,12 @@ impl<'a> Lower<'a> {
             .iter()
             .any(|&id| self.x.inputs[id].row == Some(u32::from(row)))
             || self.x.io.interps.iter().any(|(_, i)| match *i {
-            Interp::Weighted { attribute } => attribute.row == row,
-            Interp::Vertex { attribute, vertex } => {
-                attribute.row == row && vertex != 2 && self.interpolated(row)
-            }
-            Interp::Interpolated { .. } => false,
-        })
+                Interp::Weighted { attribute } => attribute.row == row,
+                Interp::Vertex { attribute, vertex } => {
+                    attribute.row == row && vertex != 2 && self.interpolated(row)
+                }
+                Interp::Interpolated { .. } => false,
+            })
     }
 
     /// Whether the program interpolates attribute row `row` (so the

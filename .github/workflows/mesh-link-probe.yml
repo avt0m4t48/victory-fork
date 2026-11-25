@@ -90,3 +90,28 @@ jobs:
             & $exe --ignored --exact $test --nocapture
             if ($LASTEXITCODE -ne 0) { throw "native WARP readback failed ($LASTEXITCODE)" }
           }
+
+          $build = cargo test -p victory-gpu --features diagnostics --lib --locked --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'failed to build the GPU tests' }
+          $exes = @($build | ConvertFrom-Json | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'victory_gpu' -and
+              $_.profile.test -and $_.executable
+          } | Select-Object -ExpandProperty executable)
+          if ($exes.Count -ne 1) { throw "expected one GPU test executable, found $($exes.Count)" }
+          $exe = $exes[0]
+          $env:VICTORY_D3D12_WARP = '1'
+          $env:VICTORY_MESH_PACK = '1'
+          $test = 'pipeline::host::tests::packed_mesh_pipeline_keeps_the_selected_shader_variants'
+          $listed = & $exe --ignored --exact $test --list
+          if ($LASTEXITCODE -ne 0 -or $listed -notcontains "${test}: test") {
+            throw "native runtime test was not found: $test"
+          }
+          & $exe --ignored --exact $test --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "native WARP pipeline test failed ($LASTEXITCODE)" }
+          $test = 'shader_cache::tests::packed_layouts_do_not_reuse_the_ordinary_cached_shader'
+          $listed = & $exe --exact $test --list
+          if ($LASTEXITCODE -ne 0 -or $listed -notcontains "${test}: test") {
+            throw "shader disk cache test was not found: $test"
+          }
+          & $exe --exact $test --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "shader disk cache test failed ($LASTEXITCODE)" }

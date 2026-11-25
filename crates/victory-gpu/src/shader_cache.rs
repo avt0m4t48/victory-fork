@@ -103,6 +103,32 @@ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
     }
 }
 
+/// Distinguishes a packed stage from the ordinary translation and other layouts.
+pub(crate) fn packing_fingerprint(build: &[u8; 32], elements: &[usize]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"victory packed mesh varyings\0");
+    hash.update(build);
+    for &element in elements {
+        hash.update(&(element as u64).to_le_bytes());
+    }
+    *hash.finalize().as_bytes()
+}
+
+pub(crate) fn packed_host_shader(
+    container: &[u8],
+    plan: &victory_shader::emit::PackedStage<'_>,
+) -> Result<HostShader, String> {
+    let translate = |_: &[u8]| plan.translate().map_err(|e| e.to_string());
+    if let Some(cache) = CACHE.get() {
+        let fingerprint = packing_fingerprint(build(), plan.elements());
+        match cached(cache, &fingerprint, container, translate) {
+            Ok(shader) => return Ok(shader),
+            Err(error) => tracing::debug!(%error, "packed shader cache could not serve a translation"),
+        }
+    }
+    translate(container)
+}
+
 /// The cache entry's converter: the build and the container in, the
 /// encoded translation out. `ran` tells a miss from a hit.
 struct Translate<F> {
@@ -394,6 +420,37 @@ mod tests {
         // Failures are not stored.
         let fail = |_: &[u8]| Err::<HostShader, _>("unsupported".to_owned());
         assert!(cached(&cache, &build, b"other", fail).is_err());
+    }
+
+    #[test]
+    fn packed_layouts_do_not_reuse_the_ordinary_cached_shader() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Cache::open(dir.path()).unwrap();
+        let build = [7; 32];
+        let variants = [
+            build,
+            packing_fingerprint(&build, &[1]),
+            packing_fingerprint(&build, &[2]),
+        ];
+        let container = b"the same pixel program";
+        let stage = |index| {
+            let mut value = shader();
+            value.dxil = vec![index as u8];
+            value
+        };
+        for index in [2, 0, 1] {
+            assert_eq!(
+                cached(&cache, &variants[index], container, |_| Ok(stage(index))),
+                Ok(stage(index))
+            );
+        }
+        let reopened = Cache::open(dir.path()).unwrap();
+        for index in [1, 0, 2] {
+            assert_eq!(
+                cached(&reopened, &variants[index], container, |_| panic!("expected a disk hit")),
+                Ok(stage(index))
+            );
+        }
     }
 
     fn walk(dir: &std::path::Path) -> Vec<PathBuf> {

@@ -6,7 +6,7 @@
 //! the immediate samplers, and directly indexed heaps.
 
 use std::ffi::{CStr, CString};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use victory_shader::emit::{ROOT_CBV_SPACE, SAMPLER_SPACE, USER_DATA_SPACE};
 use windows::Win32::Graphics::Direct3D::ID3DBlob;
@@ -268,6 +268,7 @@ pub(crate) fn bounded_root_srvs() -> bool {
 /// One stage of a host pipeline and where its bindings go.
 pub(crate) struct Stage {
     pub(crate) shader: Arc<Shader>,
+    packed: Option<Arc<Translated>>,
     /// The root parameter of its user data, and its size in dwords.
     pub(crate) user_data: Option<(u32, u32)>,
     /// Root parameters of its root views: (title root parameter, ours).
@@ -280,8 +281,9 @@ pub(crate) struct Stage {
 
 impl Stage {
     pub(crate) fn translated(&self) -> &Translated {
-        self.shader
-            .translated()
+        self.packed
+            .as_deref()
+            .or_else(|| self.shader.translated())
             .expect("host pipelines are made from translated shaders")
     }
 }
@@ -321,10 +323,49 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+fn packed_mesh_stages(shaders: &[Arc<Shader>]) -> Option<[Arc<Translated>; 2]> {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_MESH_PACK").is_some_and(|v| v == "1")) {
+        return None;
+    }
+    let mesh = shaders.iter().find(|s| s.stage == "mesh")?;
+    let pixel = shaders.iter().find(|s| s.stage == "pixel")?;
+    if !mesh.mesh_over_budget() {
+        return None;
+    }
+    let host = host()?;
+    if !host.mesh_shaders() {
+        return None;
+    }
+    let plan = victory_shader::emit::pack_mesh_outputs(
+        &mesh.container,
+        &pixel.container,
+        host.barycentrics(),
+    )?;
+    Some([
+        mesh.packed_translation(&plan.mesh)?,
+        pixel.packed_translation(&plan.pixel)?,
+    ])
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        if g.is_some()
+            && let Some(packed) = packed_mesh_stages(shaders)
+            && let Some(pipeline) = Self::create(shaders, g, packed.map(Some))
+        {
+            return Some(pipeline);
+        }
+        Self::create(shaders, g, [None, None])
+    }
+
+    fn create(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+        mut packed: [Option<Arc<Translated>>; 2],
+    ) -> Option<HostPipeline> {
         // For the report when the host device is removed: what this thread
         // has in the library from here on.
         super::library::label(format!("{shaders:?}"));
@@ -359,9 +400,6 @@ impl HostPipeline {
         if mesh.is_some() && !host()?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
-        for (s, _) in &stages {
-            s.translated()?;
-        }
         let host = host()?;
 
         // The root signature the translated shaders' bindings define.
@@ -371,15 +409,20 @@ impl HostPipeline {
         let mut ranges: Vec<Box<D3D12_DESCRIPTOR_RANGE1>> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
-        for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+        for (i, &(shader, visibility)) in stages.iter().enumerate() {
             let mut stage = Stage {
                 shader: shader.clone(),
+                packed: packed[i].take(),
                 user_data: None,
                 root_cbvs: Vec::new(),
                 root_srvs: Vec::new(),
                 root_uavs: Vec::new(),
             };
+            let t = &stage
+                .packed
+                .as_deref()
+                .or_else(|| shader.translated())?
+                .host;
             let dwords = t.user_data_dwords();
             if dwords > 0 {
                 stage.user_data = Some((params.len() as u32, dwords));
@@ -496,7 +539,7 @@ impl HostPipeline {
             }
         };
         let code = |i: usize| {
-            stages.get(i).and_then(|(s, _)| s.translated()).map_or(
+            bound.get(i).map(Stage::translated).map_or(
                 D3D12_SHADER_BYTECODE::default(),
                 |t| D3D12_SHADER_BYTECODE {
                     pShaderBytecode: t.host.dxil.as_ptr().cast(),
@@ -587,8 +630,8 @@ impl HostPipeline {
         // fall back on what `draw` does for rectangles.
         let mut rect_gs = None;
         if g.topology.0 == RECTANGLES {
-            let ps = stages.get(1).and_then(|(s, _)| s.translated());
-            let vs = &stages[0].0.translated()?.host.dxil;
+            let ps = bound.get(1).map(Stage::translated);
+            let vs = &bound[0].translated().host.dxil;
             match victory_shader::emit::rect_list_gs(vs, ps.map(|t| &t.host.dxil[..])) {
                 Ok(gs) => rect_gs = Some(gs),
                 Err(e) => tracing::warn!(error = %e, ?shaders, "no rectangle geometry stage"),
@@ -849,6 +892,53 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use super::*;
+
+    #[test]
+    #[ignore = "requires synthetic guest containers and app-local WARP"]
+    fn packed_mesh_pipeline_keeps_the_selected_shader_variants() {
+        let fixture = std::env::var_os("VICTORY_MESH_LINK_NATIVE").expect("set fixture directory");
+        let read = |name| std::fs::read(Path::new(&fixture).join(name)).expect("guest container");
+        let ordinary_mesh = super::super::shader("mesh", &read("mesh-control.cdxil"));
+        let large_mesh = super::super::shader("mesh", &read("mesh.cdxil"));
+        let pixel = super::super::shader("pixel", &read("pixel-center.cdxil"));
+        let host = host().expect("create the D3D12 WARP host");
+        assert!(host.mesh_shaders());
+        assert!(host.barycentrics());
+        let cache = tempfile::tempdir().expect("shader cache directory");
+        crate::shader_cache::use_shader_cache(cache.path().to_owned());
+
+        let create = |mesh: &Arc<Shader>| {
+            let mut graphics = GraphicsState::default();
+            graphics.depth.DepthEnable = false.into();
+            graphics.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+            graphics.targets.NumRenderTargets = 1;
+            graphics.targets.RTFormats[0] = DXGI_FORMAT_R32G32B32A32_FLOAT;
+            HostPipeline::new(&[mesh.clone(), pixel.clone()], Some(&graphics))
+        };
+        let ordinary = create(&ordinary_mesh).expect("make the standard mesh pipeline");
+        assert!(ordinary.stages.iter().all(|stage| stage.packed.is_none()));
+
+        let packed = std::thread::scope(|scope| {
+            let worker = scope.spawn(|| create(&large_mesh));
+            let packed = create(&large_mesh).expect("make the oversized mesh pipeline");
+            let concurrent = worker.join().unwrap().expect("make it concurrently");
+            for (first, second) in packed.stages.iter().zip(&concurrent.stages) {
+                assert!(first.packed.is_some());
+                assert!(std::ptr::eq(first.translated(), second.translated()));
+            }
+            packed
+        });
+        let regular_pixel = &ordinary.stages[1];
+        let packed_pixel = &packed.stages[1];
+        assert!(Arc::ptr_eq(&regular_pixel.shader, &packed_pixel.shader));
+        assert!(!std::ptr::eq(regular_pixel.translated(), packed_pixel.translated()));
+        assert_ne!(regular_pixel.translated().host.dxil, packed_pixel.translated().host.dxil);
+
+        let ordinary_again = create(&ordinary_mesh).expect("make the standard pipeline again");
+        assert!(std::ptr::eq(regular_pixel.translated(), ordinary_again.stages[1].translated()));
+        assert_eq!(crate::shader_cache::counts(), (0, 4));
+        eprintln!("WARP created both layouts and concurrent workers reused the packed variants");
+    }
 
     /// A triangle mesh shader of our own and a pixel shader for it.
     const MS: &str = "struct V { float4 p : SV_Position; };

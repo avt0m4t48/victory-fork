@@ -116,7 +116,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
-pub use mesh_pack::{PackedMesh, PackedStage, pack_mesh_outputs};
+pub use mesh_pack::{PackedMesh, PackedStage, mesh_output_over_budget, pack_mesh_outputs};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,

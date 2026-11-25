@@ -2,7 +2,7 @@
 
 use crate::dxbc::{Container, FourCC, u32_at};
 use crate::io::{self, Barycentric, Interp, Target};
-use crate::native::{HwStage, StageIo, Usage};
+use crate::native::{HwStage, NativeProgram, StageIo, Usage};
 use crate::{ShaderError, spill};
 
 use super::container::{MESH_OUTPUT_LIMIT, SigElement, mesh_output_bytes};
@@ -32,6 +32,50 @@ pub struct PackedMesh<'a> {
     pub pixel: PackedStage<'a>,
 }
 
+struct OversizedMesh<'a> {
+    native: NativeProgram,
+    raw_outputs: &'a [u8],
+    outputs: Vec<SigElement>,
+    prims: Vec<SigElement>,
+}
+
+/// Whether this mesh is a candidate without examining a pixel shader.
+pub fn mesh_output_over_budget(mesh: &[u8]) -> bool {
+    oversized_mesh(mesh).is_some()
+}
+
+fn oversized_mesh(mesh: &[u8]) -> Option<OversizedMesh<'_>> {
+    let mc = Container::parse(mesh).ok()?;
+    let native = executable_program(&mc).ok()?;
+    let StageIo::Ms(ms) = &native.io else {
+        return None;
+    };
+    if native.stage != HwStage::Ms
+        || ms.threads != 128
+        || ms.max_vertices != 128
+        || ms.topology != 2
+    {
+        return None;
+    }
+    let raw_outputs = mc.part(FourCC::OSG1)?.data;
+    let outputs = signature(raw_outputs).ok()?;
+    let mut prims = match mc.part(FourCC::PSG1) {
+        Some(part) => signature(part.data).ok()?,
+        None => Vec::new(),
+    };
+    prims.retain(|e| !matches!(e.kind, 10 | 30));
+    if mesh_output_bytes(&outputs, &prims, ms.max_vertices, ms.max_primitives) <= MESH_OUTPUT_LIMIT
+    {
+        return None;
+    }
+    Some(OversizedMesh {
+        native,
+        raw_outputs,
+        outputs,
+        prims,
+    })
+}
+
 /// Selects complete FP16 pairs for the 128-vertex meshes whose original
 /// signature is over budget. An unproven pairing leaves the normal path in use.
 pub fn pack_mesh_outputs<'a>(
@@ -39,27 +83,18 @@ pub fn pack_mesh_outputs<'a>(
     pixel: &'a [u8],
     barycentrics: bool,
 ) -> Option<PackedMesh<'a>> {
-    let mc = Container::parse(mesh).ok()?;
-    let mn = executable_program(&mc).ok()?;
+    let OversizedMesh {
+        native: mn,
+        raw_outputs,
+        mut outputs,
+        prims,
+    } = oversized_mesh(mesh)?;
     let StageIo::Ms(ms) = &mn.io else {
         return None;
     };
-    if mn.stage != HwStage::Ms || ms.threads != 128 || ms.max_vertices != 128 || ms.topology != 2 {
-        return None;
-    }
-    let raw_outputs = mc.part(FourCC::OSG1)?.data;
-    let mut outputs = signature(raw_outputs).ok()?;
-    let mut prims = match mc.part(FourCC::PSG1) {
-        Some(part) => signature(part.data).ok()?,
-        None => Vec::new(),
-    };
-    prims.retain(|e| !matches!(e.kind, 10 | 30));
     let fits = |outputs: &[SigElement]| {
         mesh_output_bytes(outputs, &prims, ms.max_vertices, ms.max_primitives) <= MESH_OUTPUT_LIMIT
     };
-    if fits(&outputs[..]) {
-        return None;
-    }
 
     let pc = Container::parse(pixel).ok()?;
     let pn = executable_program(&pc).ok()?;
