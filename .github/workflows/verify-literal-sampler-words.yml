@@ -1,0 +1,25 @@
+name: Literal operands in sampler descriptors
+on:
+  push:
+    branches: [verify/literal-sampler-words]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm the source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '367d54e96951f50076a303afcc0d4f38e84f65c2') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-literal-sampler-words.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the Windows shader suite
+        shell: pwsh
+        run: cargo test --locked -p victory-shader --lib -- --test-threads=1
