@@ -1,0 +1,63 @@
+name: Embedded shader spans in the Windows CLI
+on:
+  push:
+    branches: ['verify/embedded-shader-spans-1090299-*']
+permissions:
+  contents: read
+jobs:
+  investigate:
+    name: ${{ matrix.name }} on Windows
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: original baseline
+            revision: 0b0074e0b2765e574c622e9a3de566f20f04135b
+            raw: 0
+            packed: 0
+          - name: raw-fix parent
+            revision: 5fa3a0c032906bb4247e3b2cfad2abeb2091b1d2
+            raw: 1
+            packed: 0
+          - name: exact candidate
+            revision: 1090299599e2de9750156e63269e48982382687c
+            raw: 1
+            packed: 1
+          - name: current upstream
+            revision: d510ee4a9b635bcc345207a73ccb4c4fceb8228c
+            raw: 0
+            packed: 0
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Select exact revision and share the candidate fixtures
+        shell: pwsh
+        run: |
+          $fixture = "apps/victory/tests/embedded_shader.rs"
+          $temp = Join-Path $env:RUNNER_TEMP "embedded_shader.rs"
+          Copy-Item $fixture $temp
+          git switch --detach ${{ matrix.revision }}
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          git rev-parse HEAD
+          $source = Get-Content -Raw $temp
+          $source.Replace('    String::from_utf8(result.stdout).unwrap()', '    let stdout = String::from_utf8(result.stdout).unwrap(); println!("{stdout}"); stdout') | Set-Content $fixture
+      - run: rustup toolchain install
+      - name: Run raw and packed fixtures through victory.exe
+        shell: pwsh
+        run: |
+          foreach ($test in @(
+            @{ Name = "warm_finds_each_embedded_shader_by_its_standalone_hash"; Expected = ${{ matrix.raw }} },
+            @{ Name = "warm_finds_a_packed_shader_by_its_declared_container_bytes"; Expected = ${{ matrix.packed }} }
+          )) {
+            Write-Host "Fixture: $($test.Name)"
+            $output = cargo test --locked -p victory --test embedded_shader $test.Name -- --exact --nocapture 2>&1
+            $exit = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host $_ }
+            Write-Host "cargo exit: $exit"
+            $expectedExit = if ($test.Expected -eq 1) { 0 } else { 101 }
+            if ($exit -ne $expectedExit -or ($output -join "`n") -notmatch "1 hashes asked, $($test.Expected) found") {
+              throw "Unexpected fixture outcome"
+            }
+          }
