@@ -370,6 +370,74 @@ struct Physical {
     pages: HashMap<usize, Slice>,
     /// Mapped views by address: their length and what they show.
     views: BTreeMap<usize, (usize, Slice)>,
+    /// Where each page of a section shows in title memory: by the section
+    /// (its `Arc`'s address) and the page's index in it, the addresses of
+    /// the 64 KiB pages of views that show it ([`written`]).
+    shown: HashMap<(usize, usize), Vec<usize>>,
+}
+
+impl Physical {
+    /// Notes the view at `base` of `len` bytes showing `slice` onwards in
+    /// [`Physical::shown`] (`add`), or takes it out.
+    fn note_shown(&mut self, base: usize, len: usize, slice: &Slice, add: bool) {
+        let section = Arc::as_ptr(&slice.section) as usize;
+        for k in 0..len / PAGE {
+            let key = (section, slice.index + k);
+            let at = base + k * PAGE;
+            if add {
+                self.shown.entry(key).or_default().push(at);
+            } else if let Some(list) = self.shown.get_mut(&key) {
+                list.retain(|&a| a != at);
+                if list.is_empty() {
+                    self.shown.remove(&key);
+                }
+            }
+        }
+    }
+}
+
+/// We wrote bytes `[offset, offset + len)` of the physical pages `pages`
+/// through a view of our own (DirectStorage destinations): the title's
+/// addresses that show those pages saw no write. Neither the write watch
+/// nor the guards there know of it, and a texture placed there was looked
+/// at only if a sampled check happened to catch the change: in run vg28
+/// over 1,000 textures picked by index were found changed after their
+/// upload "with nothing to tell of it", and pieces of textures whose other
+/// parts arrived first stayed stale (blocky patches on clothing). Each
+/// address range showing the bytes is now told, after the bytes landed,
+/// as a write the runtime makes through the kernel is.
+pub(crate) fn written(pages: &[usize], offset: usize, len: usize) {
+    let Some(end) = offset.checked_add(len) else { return };
+    let first = offset / PAGE;
+    let Some(pages) = pages.get(first..end.div_ceil(PAGE)) else { return };
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    {
+        let physical = physical();
+        for (k, page) in pages.iter().enumerate() {
+            let Some(slice) = physical.pages.get(page) else { continue };
+            let Some(shown) = physical.shown.get(&(Arc::as_ptr(&slice.section) as usize, slice.index)) else {
+                continue;
+            };
+            // The part of this page that was written.
+            let page_start = (first + k) * PAGE;
+            let lo = offset.max(page_start) - page_start;
+            let hi = end.min(page_start + PAGE) - page_start;
+            for &at in shown {
+                ranges.push((at + lo, hi - lo));
+            }
+        }
+    }
+    ranges.sort_unstable();
+    let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (at, n) in ranges {
+        match joined.last_mut() {
+            Some(last) if last.0 + last.1 >= at => last.1 = last.1.max(at + n - last.0),
+            _ => joined.push((at, n)),
+        }
+    }
+    for (at, n) in joined {
+        victory_gpu::kernel_will_write(at, n);
+    }
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -786,6 +854,7 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    physical.note_shown(base, len, &slice, true);
     physical.views.insert(base, (len, slice));
     true
 }
@@ -864,6 +933,7 @@ fn unmap(physical: &mut Physical, base: usize, len: usize) {
         let Some((size, slice)) = physical.views.remove(&at) else {
             continue;
         };
+        physical.note_shown(at, size, &slice, false);
         victory_gpu::title_memory_remapped(at, size);
         // SAFETY: a view we mapped; it becomes a placeholder again.
         unsafe {
