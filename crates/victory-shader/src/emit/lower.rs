@@ -1016,7 +1016,8 @@ fn own_bits_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_OWN_BITS").is_none_or(|v| v != "0"))
 }
 
-pub(super) fn host_max_wave() -> u32 {
+/// What [`set_host_max_wave`] was told (0: nothing).
+pub fn host_max_wave() -> u32 {
     #[cfg(test)]
     if let Some(lanes) = TEST_HOST_WAVE.get() {
         return lanes;
@@ -2050,6 +2051,20 @@ impl<'a> Lower<'a> {
         self.f16_nearest(f)
     }
 
+    /// The sum of the low halves of `x` over the lanes that run here, in
+    /// single precision, as a half.
+    fn half_sum_here(&mut self, x: V) -> V {
+        let c = self.cur;
+        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
+        self.s.flags |= flags::WAVE_OPS;
+        let low = self.s.m.i32(0xFFFF);
+        let h = self.s.m.bin(c, Bin::And, x, low);
+        let f = self.s.op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[h]);
+        let k = self.s.m.i8(0);
+        let sum = self.s.op(c, "waveActiveOp.f32", Attr::NoUnwind, f32t, 119, &[f, k, k]);
+        self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[sum])
+    }
+
     /// `WaveActiveSum` of 16-bit floats (`x`: each lane's term in its low half, +0 in the
     /// lanes outside the mask), bit for bit as the console adds it: every addition rounds to
     /// 16 bits, so the order counts, and the compiler's is the balanced tree over the lanes
@@ -2084,8 +2099,16 @@ impl<'a> Lower<'a> {
         if !every {
             if halves {
                 need(self.cur_ir);
+                return Err(WHERE);
             }
-            return Err(WHERE);
+            // One host wave of 64, some of its lanes elsewhere: their terms
+            // are +0 on the console, so the sum of the lanes here is the
+            // sum.
+            // shortcut: in single precision, rounded once; the console
+            // rounds every addition to 16 bits. (the title's
+            // neural networks, CS_TransposeVecMatMulAlignedOperation, in a
+            // block only the lanes inside the matrix reach.)
+            return Ok(self.half_sum_here(x));
         }
         let c = self.cur;
         let i32t = self.s.t.i32;
@@ -2284,7 +2307,15 @@ impl<'a> Lower<'a> {
             // host's value can be.
             Input::FrontFace => (13, 0),
             Input::ThreadIdInGroup(c) => return self.thread_id(c),
-            Input::GroupId(c) => return self.compute_id("groupId.i32", 94, c),
+            Input::GroupId(c) => {
+                let id = self.compute_id("groupId.i32", 94, c);
+                if !self.one_dimensional() {
+                    return id;
+                }
+                let Val::I32(id) = id else { unreachable!() };
+                let base = self.host_word(RootType::Other(super::shader::USER_GROUP_BASE), 0, 0);
+                return Val::I32(self.s.m.bin(self.s.entry, Bin::Add, id, base));
+            }
             Input::GroupInfo => return Val::Missing("the thread-group info SGPR"),
             Input::MeshGroup => {
                 let Val::I32(g) = self.compute_id("groupId.i32", 94, 0) else {
@@ -2350,6 +2381,16 @@ impl<'a> Lower<'a> {
     }
 
     /// A component of a compute thread or group id, read in the entry block.
+    /// Whether the program is a compute program that reads its group's
+    /// number in x alone, with room for a dword of the host's among its user data
+    /// (the host's root signature holds 64 dwords, views included).
+    fn one_dimensional(&self) -> bool {
+        const MOST: u32 = 20;
+        let reads = |c| self.x.io.inputs.iter().any(|i| i.1 == Input::GroupId(c));
+        let words = self.x.native.layout.iter().map(|e| u32::from(e.user_data) + e.sgprs).max().unwrap_or(0);
+        matches!(self.x.native.io, StageIo::Cs(_)) && reads(0) && !reads(1) && !reads(2) && words <= MOST && !crate::spill::is_spilled(self.x.native)
+    }
+
     fn compute_id(&mut self, name: &str, opcode: u32, c: u8) -> Val {
         let (entry, c) = (self.s.entry, self.s.m.i32(u32::from(c)));
         Val::I32(
@@ -10751,8 +10792,11 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
-    /// Mesh: `exp prim` as the lane's primitive. Bit 31 culls it (all
-    /// indices 0: no area).
+    /// Mesh: `exp prim` as the lane's primitive. Each corner takes ten
+    /// bits: a 9-bit vertex index and, above it, its edge flag (bits 9, 19
+    /// and 29), which only the console's edge-flag rasterisation reads and
+    /// which is no part of the index. Bit 31 culls it (all indices 0: no
+    /// area).
     fn emit_indices(&mut self, e: &Export, guard: Option<V>) -> Result<(), Why> {
         let v = e.values[0].ok_or("a primitive export without its indices")?;
         let x = self.i32_of(v)?;
@@ -10785,7 +10829,7 @@ impl<'a> Lower<'a> {
         });
         let mut indices = [z; 3];
         for (k, slot) in indices.iter_mut().enumerate() {
-            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x3FF));
+            let (shift, mask) = (self.s.m.i32(10 * k as u32), self.s.m.i32(0x1FF));
             let i = self.s.m.bin(c, Bin::LShr, x, shift);
             let i = self.s.m.bin(c, Bin::And, i, mask);
             if let Some(n) = written {

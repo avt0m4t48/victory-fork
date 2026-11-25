@@ -406,7 +406,7 @@ impl Physical {
 /// parts arrived first stayed stale (blocky patches on clothing). Each
 /// address range showing the bytes is now told, after the bytes landed,
 /// as a write the runtime makes through the kernel is.
-pub(crate) fn written(pages: &[usize], offset: usize, len: usize) {
+pub(crate) fn written_pages(pages: &[usize], offset: usize, len: usize) {
     let Some(end) = offset.checked_add(len) else { return };
     let first = offset / PAGE;
     let Some(pages) = pages.get(first..end.div_ceil(PAGE)) else { return };
@@ -437,6 +437,13 @@ pub(crate) fn written(pages: &[usize], offset: usize, len: usize) {
     }
     for (at, n) in joined {
         victory_gpu::kernel_will_write(at, n);
+    }
+}
+
+impl Slice {
+    /// The page `k` pages on, as [`Physical::shown`] names it.
+    fn key(&self, k: usize) -> (usize, usize) {
+        (Arc::as_ptr(&self.section) as usize, self.index + k)
     }
 }
 
@@ -627,8 +634,27 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
+        written(slice, *n);
     }
     true
+}
+
+/// After writes into `n` pages from `slice` on through a view of our own:
+/// where the title sees those pages, the GPU side has to copy them again (it
+/// does not see such writes).
+fn written(slice: &Slice, n: usize) {
+    let mut shown: Vec<usize> = {
+        let physical = physical();
+        (0..n)
+            .filter_map(|k| physical.shown.get(&slice.key(k)))
+            .flatten()
+            .copied()
+            .collect()
+    };
+    shown.sort_unstable();
+    for run in shown.chunk_by(|a, b| a + PAGE == *b) {
+        victory_gpu::kernel_will_write(run[0], run.len() * PAGE);
+    }
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
@@ -638,6 +664,13 @@ pub(crate) struct PageWindow {
     view: View,
     within: usize,
     len: usize,
+    slice: Slice,
+}
+
+impl Drop for PageWindow {
+    fn drop(&mut self) {
+        written(&self.slice, self.view.len / PAGE);
+    }
 }
 
 impl PageWindow {
@@ -661,6 +694,7 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         view: View::map(slice, *n)?,
         within: offset % PAGE,
         len,
+        slice: slice.clone(),
     })
 }
 
@@ -1478,6 +1512,37 @@ mod tests {
         );
         assert_eq!(XMemFreePhysicalPages(2, a.as_ptr()), 1);
         assert_eq!(XMemFreePhysicalPages(1, b.as_ptr()), 1);
+    }
+
+    /// Pages know where they are shown, as views come, are cut and go.
+    #[test]
+    fn pages_know_where_they_are_shown() {
+        let (mut count, mut pages) = (4usize, [0usize; 4]);
+        assert_eq!(XMemAllocatePhysicalPages(0, &mut count, pages.as_mut_ptr()), 1);
+        let kind = MEM_RESERVE | PAGES_64K;
+        let base = XMemVirtualAlloc(std::ptr::null_mut(), 8 * PAGE, kind, 3, PAGE_READWRITE);
+        assert!(!base.is_null());
+        let at = base as usize;
+        let shown = |page: usize| {
+            let physical = physical();
+            let key = physical.pages[&page].key(0);
+            let mut shown = physical.shown.get(&key).cloned().unwrap_or_default();
+            shown.sort_unstable();
+            shown
+        };
+        assert_eq!(XMemMapPhysicalPages(base, 4, pages.as_ptr()), base);
+        assert_eq!(shown(pages[2]), [at + 2 * PAGE]);
+        // Shown twice; the first view cut in two.
+        let second = (at + 5 * PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(second, 1, &pages[2]), second);
+        assert_eq!(shown(pages[2]), [at + 2 * PAGE, at + 5 * PAGE]);
+        let gone = (at + 2 * PAGE) as *mut c_void;
+        XMemMapPhysicalPages(gone, 1, std::ptr::null());
+        assert_eq!(shown(pages[2]), [at + 5 * PAGE]);
+        assert_eq!(shown(pages[1]), [at + PAGE]);
+        assert_eq!(shown(pages[3]), [at + 3 * PAGE]);
+        XMemMapPhysicalPages(base, 8, std::ptr::null());
+        assert!(pages.iter().all(|&p| shown(p).is_empty()));
     }
 
     #[test]

@@ -913,8 +913,25 @@ fn execute(request: &Request) -> Result<(), HRESULT> {
             return Err(fail(E_INVALIDARG, "source larger than destination"));
         }
         let size = request.source_size as usize;
-        return into_destination(request, size, |out| read_into(request, out).map(|()| size))
-            .map_err(|hr| fail(hr, "copying"));
+        // A file read into a title address is the kernel's write, and the
+        // kernel does not fault into the GPU side's guard: a block guarded
+        // again between `kernel_will_write` and the read (the guard over all
+        // the views of a page protects other views from other threads) made
+        // the read fail with ERROR_INVALID_USER_BUFFER, and the title stops
+        // at the failed request (runs amd-C and amd-C2, seconds after the
+        // world's first frame). It is read beside and copied in: our copy
+        // faults into the guard like the title's own writes.
+        let bounce = options & (PAGE_DESTINATION | MEMORY_SOURCE) == 0;
+        return into_destination(request, size, |out| {
+            if !bounce {
+                return read_into(request, out).map(|()| size);
+            }
+            let mut data = vec![0; size];
+            read_into(request, &mut data)?;
+            out.copy_from_slice(&data);
+            Ok(size)
+        })
+        .map_err(|hr| fail(hr, "copying"));
     }
     let tables = if bc != 0 { Some(bcpack_tables()?) } else { None };
     let source = read_source(request).map_err(|hr| fail(hr, "reading the source"))?;
@@ -1088,8 +1105,10 @@ fn into_destination(
     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
 ) -> Result<(), HRESULT> {
     if request.options & PAGE_DESTINATION == 0 {
-        // Raw reads land through the kernel, which does not fault into the
-        // GPU side's guard on title buffers; open them first.
+        // Opens the guarded blocks and tells the GPU side a placed texture
+        // there changes. `fill` writes from user mode (a file read is read
+        // beside first, see `execute`), so a block guarded again meanwhile
+        // faults into the guard instead of failing the write.
         victory_gpu::kernel_will_write(request.destination as usize, len);
         // SAFETY: the title's destination holds `destination_size` bytes, at
         // least `len`, and nothing else writes it until completion.
@@ -1104,14 +1123,7 @@ fn into_destination(
         return result;
     }
     let offset = (request.page_offset & 0xffff) as usize;
-    // SAFETY: the title passes a page number per 64 KiB of destination,
-    // which holds at least `len` bytes from `offset`.
-    let pages = unsafe {
-        std::slice::from_raw_parts(
-            request.destination.cast::<usize>(),
-            (offset + len).div_ceil(PAGE),
-        )
-    };
+    let pages = &filled(request.destination.cast(), (offset + len).div_ceil(PAGE))[..];
     // Consecutive pages of one allocation (the usual case): written in
     // place through one view.
     if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
@@ -1119,7 +1131,7 @@ fn into_destination(
         drop(window);
         // The title's addresses that show these pages saw no write: tell them.
         if result.is_ok() {
-            super::xmem::written(pages, offset, len);
+            super::xmem::written_pages(pages, offset, len);
         }
         return result;
     }
@@ -1145,7 +1157,7 @@ fn into_destination(
             tracing::info!(offset, len, tries, "dstorage: a destination's physical pages written after a retry");
         }
         // The title's addresses that show these pages saw no write: tell them.
-        super::xmem::written(pages, offset, n);
+        super::xmem::written_pages(pages, offset, n);
         Ok(())
     } else {
         let known = super::xmem::pages_known(pages, offset, len);
@@ -1158,10 +1170,46 @@ fn into_destination(
             offset,
             len,
             pages = pages.len(),
+            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
+            options = format_args!("{:#x}", request.options),
             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
         );
         Err(E_INVALIDARG)
     }
+}
+
+/// The page numbers of a destination. The title fills the array after it
+/// enqueued the request (a copy taken then holds zeros, or the numbers of
+/// the array's last use), so it is read when the request runs; a number
+/// that is still zero then is waited for, a tenth of a second at most.
+fn filled(array: *const usize, n: usize) -> Vec<usize> {
+    static LATE: AtomicU64 = AtomicU64::new(0);
+    let read = || -> Vec<usize> {
+        // SAFETY: the title passes a page number per 64 KiB of destination
+        // and keeps the array until the request completes; it may write it
+        // from another thread meanwhile.
+        (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
+    };
+    let mut pages = read();
+    if !pages.contains(&0) {
+        return pages;
+    }
+    let began = std::time::Instant::now();
+    while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        pages = read();
+    }
+    let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
+    if late <= 8 || late.is_power_of_two() {
+        tracing::warn!(
+            requests = late,
+            pages = n,
+            waited_ms = began.elapsed().as_millis() as u64,
+            filled = !pages.contains(&0),
+            "dstorage: a request ran before its page array was filled"
+        );
+    }
+    pages
 }
 
 /// Slots by the 2020 order, which the argument shapes at
@@ -1315,6 +1363,20 @@ mod tests {
 
     fn pattern(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
+    }
+
+    #[test]
+    fn a_page_array_filled_late_is_waited_for() {
+        let array: &'static [std::sync::atomic::AtomicUsize] = Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(7), std::sync::atomic::AtomicUsize::new(0)]));
+        let title = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            array[1].store(8, Ordering::Release);
+        });
+        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
+        title.join().unwrap();
+        // One never filled is given up on.
+        array[0].store(0, Ordering::Release);
+        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
     }
 
     #[test]

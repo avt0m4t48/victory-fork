@@ -64,6 +64,8 @@ pub(crate) struct Back {
     /// The texture's title memory and its layout's bytes.
     at: usize,
     size: usize,
+    /// Width, height, format (for the log).
+    kind: Option<(u64, u32, u32)>,
 }
 
 /// Records into `list` the copy of `texture` (title resource `resource`'s
@@ -110,7 +112,8 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, resource: This, texture: 
         unsafe { list.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
     }
     COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Some(Back { buffer, footprints, rows, mips, layout, at, size })
+    let kind = crate::resource::texture_kind(resource);
+    Some(Back { buffer, footprints, rows, mips, layout, at, size, kind })
 }
 
 /// Textures copied back since the start.
@@ -137,8 +140,20 @@ pub(crate) fn land(back: &Back) {
         // SAFETY: the subresource's part of the mapped buffer.
         let linear = unsafe { std::slice::from_raw_parts(data.cast::<u8>().add(footprint.Offset as usize), len) };
         if let Err(e) = back.layout.tile(&mut tiled, mip, slice, linear, pitch, pitch * rows as usize) {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(?e, mip, slice, "a texture copied back could not be tiled"));
+            static SEEN: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+            if !seen.contains(&back.at) {
+                seen.push(back.at);
+                tracing::warn!(
+                    ?e,
+                    mip,
+                    slice,
+                    kind = ?back.kind,
+                    at = format_args!("{:#x}", back.at),
+                    desc = ?back.layout.desc,
+                    "a texture copied back could not be tiled (logged once per texture)"
+                );
+            }
             // SAFETY: mapped above.
             unsafe { back.buffer.Unmap(0, None) };
             return;
