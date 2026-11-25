@@ -1,0 +1,31 @@
+name: Reproduce a lost retirement when a WARP submission completes
+on:
+  push:
+    branches: [verify/retire-completion-race-red]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_LATE_WAIT: '0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 4
+      - name: Validate baseline and test-only changes
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne '0b0074e0b2765e574c622e9a3de566f20f04135b') { throw 'Unexpected baseline' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-gpu/src/host.rs') { throw 'Unexpected test changes' }
+      - name: Pause a retirement until the pending fence is completed and buried
+        shell: pwsh
+        run: |
+          $test = 'host::retirement_race_probe::retirement_racing_completion_is_dropped_without_a_later_submission'
+          $log = cargo test --locked -p victory-gpu --features diagnostics --lib $test -- --exact --nocapture 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Output $log
+          if ($code -ne 101 -or $log -notmatch 'assertion.+retirement missed the final submission.s completion' -or $log -notmatch 'left: 0') { throw 'Expected the racing retirement to remain queued' }
