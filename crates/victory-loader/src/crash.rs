@@ -663,14 +663,27 @@ mod tests {
     use super::*;
     use windows_sys::Win32::System::Diagnostics::Debug::{EXCEPTION_RECORD, RtlCaptureContext};
 
-    // Two Win64 non-leaf frames with explicit unwind records and named return
+    // Three Win64 non-leaf frames with explicit unwind records and named return
     // addresses. Each reserves 32 bytes of shadow space and aligns RSP for its call.
-    // Each return label precedes the epilogue so the walker uses the unwind record.
+    // The middle return PC is at the start of the epilogue. The entry frame's
+    // return PC checks that the walker continues past that epilogue.
     std::arch::global_asm!(
         ".text",
-        ".globl victory_test_unwind_outer",
+        ".globl victory_test_unwind_entry",
+        ".globl victory_test_unwind_entry_return",
         ".globl victory_test_unwind_outer_return",
         ".globl victory_test_unwind_inner_return",
+        ".seh_proc victory_test_unwind_entry",
+        "victory_test_unwind_entry:",
+        "sub rsp, 40",
+        ".seh_stackalloc 40",
+        ".seh_endprologue",
+        "call victory_test_unwind_outer",
+        "victory_test_unwind_entry_return:",
+        "nop",
+        "add rsp, 40",
+        "ret",
+        ".seh_endproc",
         ".seh_proc victory_test_unwind_outer",
         "victory_test_unwind_outer:",
         "sub rsp, 40",
@@ -678,7 +691,6 @@ mod tests {
         ".seh_endprologue",
         "call victory_test_unwind_inner",
         "victory_test_unwind_outer_return:",
-        "nop",
         "add rsp, 40",
         "ret",
         ".seh_endproc",
@@ -696,17 +708,18 @@ mod tests {
     );
 
     unsafe extern "system" {
-        fn victory_test_unwind_outer(
-            callers: &mut [u64; 2],
-            capture: extern "system" fn(&mut [u64; 2]),
+        fn victory_test_unwind_entry(
+            callers: &mut [u64; 3],
+            capture: extern "system" fn(&mut [u64; 3]),
         );
         static victory_test_unwind_inner_return: u8;
         static victory_test_unwind_outer_return: u8;
+        static victory_test_unwind_entry_return: u8;
     }
 
     #[test]
     fn unwinds_known_callers() {
-        extern "system" fn capture(callers: &mut [u64; 2]) {
+        extern "system" fn capture(callers: &mut [u64; 3]) {
             // SAFETY: the zeroed CONTEXT is 16-byte aligned and writable.
             let context = unsafe {
                 let mut context = Aligned16(std::mem::zeroed());
@@ -718,15 +731,16 @@ mod tests {
             }
         }
 
-        let mut callers = [0; 2];
-        // SAFETY: both assembly frames use the Win64 ABI and forward the
+        let mut callers = [0; 3];
+        // SAFETY: the assembly frames use the Win64 ABI and forward the
         // caller buffer in RCX to the callback supplied in RDX.
-        unsafe { victory_test_unwind_outer(&mut callers, capture) };
+        unsafe { victory_test_unwind_entry(&mut callers, capture) };
         assert_eq!(
             callers,
             [
                 (&raw const victory_test_unwind_inner_return) as u64,
                 (&raw const victory_test_unwind_outer_return) as u64,
+                (&raw const victory_test_unwind_entry_return) as u64,
             ],
         );
     }
