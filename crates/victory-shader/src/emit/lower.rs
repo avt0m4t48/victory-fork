@@ -845,11 +845,15 @@ fn lds_use(name: &str) -> LdsUse {
 }
 
 /// Per value, the instruction that writes it (for [`lds_dwords`]).
-fn lds_value_defs(p: &crate::ir::Program) -> HashMap<Value, &Inst> {
+fn lds_value_defs<'a>(p: &'a crate::ir::Program, st: &Structured) -> HashMap<Value, &'a Inst> {
     let mut defs = HashMap::new();
-    for block in &p.blocks {
-        for inst in &block.insts {
-            for &(_, v) in &inst.writes {
+    for (block, guards) in p.blocks.iter().zip(&st.guards) {
+        for (inst, guard) in block.insts.iter().zip(guards) {
+            for &(reg, v) in &inst.writes {
+                // A guarded vector write keeps the old value outside EXEC.
+                if guard.is_some() && matches!(reg, Reg::V(_)) {
+                    continue;
+                }
                 defs.insert(v, inst);
             }
         }
@@ -925,6 +929,67 @@ fn lds_conflict(uses: &[(LdsUse, Option<Vec<u32>>)]) -> bool {
 #[cfg(test)]
 mod lds_exact_tests {
     use super::{LdsUse, lds_conflict, lds_use};
+
+    #[test]
+    fn a_masked_move_does_not_give_every_lane_the_same_lds_address() {
+        let words: [u32; 15] = [
+            0x7E02_0280, // v_mov_b32 v1, 0 (every lane)
+            0x7E04_0280, // v_mov_b32 v2, 0 (every lane)
+            0x7D88_0000, // v_cmp_gt_u32 vcc, s0, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0x7E02_0284, // v_mov_b32 v1, 4 (only lanes below s0)
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0x7D88_0001, // v_cmp_gt_u32 vcc, s1, v0
+            0xBE8C_246A, // s_and_saveexec_b64 s[12:13], vcc
+            0xBF88_0004, // s_cbranch_execz to the restore
+            0xD8D8_0000,
+            0x0300_0001, // ds_read_b32 v3, v1
+            0xD834_0000,
+            0x0000_0302, // ds_write_b32 v2, v3
+            0xBEFE_040C, // s_mov_b64 exec, s[12:13]
+            0xBF81_0000, // s_endpgm
+        ];
+        let code: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let p = crate::ir::build(&code, true, 16).expect("valid GFX10 program");
+        let st = crate::structure::structure(&p).expect("structured lane masks");
+        let masked_mov = p
+            .blocks
+            .iter()
+            .zip(&st.guards)
+            .flat_map(|(block, guards)| block.insts.iter().zip(guards))
+            .find(|(inst, _)| inst.machine.offset == 16)
+            .expect("masked move in IR");
+        assert!(masked_mov.1.is_some());
+
+        let defs = super::lds_value_defs(&p, &st);
+        let uses: Vec<_> = p
+            .blocks
+            .iter()
+            .flat_map(|block| &block.insts)
+            .filter(|inst| matches!(inst.name(), "ds_read_b32" | "ds_write_b32"))
+            .map(|inst| (lds_use(inst.name()), super::lds_dwords(&defs, inst)))
+            .collect();
+        assert_eq!(uses.len(), 2);
+        assert_eq!(uses[1], (LdsUse::Write, Some(vec![0])));
+        let all = super::all_lane_blocks(&st).expect("structured all-lane regions");
+        let can_split = super::lds_meetings(&p, &st, &all).is_some();
+        // When s1 > s0, some reading lanes still hold the old address 0.
+        assert!(
+            lds_conflict(&uses) && !can_split,
+            "may read and write dword 0: {uses:?}; accepted by the split analysis: {can_split}"
+        );
+
+        if std::env::var_os("VICTORY_LDS_EXACT").is_some_and(|v| v == "1") {
+            let mut disjoint = words;
+            disjoint[3] = 0xBF80_0000; // s_nop in place of the first mask
+            disjoint[5] = 0xBF80_0000; // s_nop in place of its restore
+            let code: Vec<u8> = disjoint.iter().flat_map(|word| word.to_le_bytes()).collect();
+            let p = crate::ir::build(&code, true, 16).unwrap();
+            let st = crate::structure::structure(&p).unwrap();
+            let all = super::all_lane_blocks(&st).unwrap();
+            assert!(super::lds_meetings(&p, &st, &all).is_some(), "all reads use dword 1");
+        }
+    }
 
     #[test]
     fn kinds() {
@@ -1005,7 +1070,7 @@ fn lds_meetings(p: &crate::ir::Program, st: &Structured, all: &[bool]) -> Option
     let mut reads = vec![false; n];
     let mut writes = vec![false; n];
     let mut uses: Vec<Vec<(LdsUse, Option<Vec<u32>>)>> = vec![Vec::new(); n];
-    let defs = lds_value_defs(p);
+    let defs = lds_value_defs(p, st);
     for (b, block) in p.blocks.iter().enumerate().take(n) {
         if all[b] {
             continue;
