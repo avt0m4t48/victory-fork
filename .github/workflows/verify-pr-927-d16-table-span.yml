@@ -1,0 +1,59 @@
+name: D16 dynamic table span
+on:
+  push:
+    branches: [verify/pr-927-d16-table-span]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm the PR source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne 'befaf3b5aa91966d2569985eeba808d4d8017026') { throw 'Unexpected PR head' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-gpu/src/descriptor.rs') { throw 'Unexpected probe changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the revised shader metadata
+        shell: pwsh
+        run: cargo test --locked -p victory-shader --lib half_places_are_the_descriptors_the_program_loads -- --test-threads=1
+      - name: Check the original table reservation
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib a_fresh_half_table_includes_the_last_descriptor_the_shader_reads -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output -join ' '
+          if ($code -ne 101 -or $log -notmatch 'panicked at' -or $log -notmatch "an unrelated allocation overlaps the shader's second slot") {
+            throw 'The original runtime did not fail at the slot-reservation assertion'
+          }
+          Write-Output 'Confirmed the missing slot in the table reservation'
+          exit 0
+      - name: Count the half descriptor among the dynamic slots
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          path = Path("crates/victory-gpu/src/draw.rs")
+          source = path.read_text(encoding="utf-8")
+          before = "            selected.sort_unstable();"
+          after = """            selected.extend(
+                          half.iter()
+                              .filter(|&&(table_slot, _)| table_slot == slot)
+                              .map(|&(_, dword)| dword / 8),
+                      );
+                      selected.sort_unstable();"""
+          assert source.count(before) == 1
+          path.write_text(source.replace(before, after), encoding="utf-8")
+          '@ | python -
+          if ($LASTEXITCODE) { throw 'Unable to change the dynamic table span' }
+          cargo test --locked -p victory-gpu --features diagnostics --lib a_fresh_half_table_includes_the_last_descriptor_the_shader_reads -- --test-threads=1 --nocapture
+          if ($LASTEXITCODE) { throw 'The reservation did not cover both descriptors' }
