@@ -1,0 +1,32 @@
+name: Observe a later title-memory mapping from a closed WARP list
+on:
+  push:
+    branches: [verify/pr-937-memory-directory]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_LATE_WAIT: '0'
+      VICTORY_INPLACE: '0'
+      VICTORY_GPU_TIMING: ''
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm current main and verify only probe code was added
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne '0b0074e0b2765e574c622e9a3de566f20f04135b') { throw 'Unexpected main' }
+          $files = (git diff --name-only HEAD~2 HEAD~1) -join ','
+          if ($files -ne 'crates/victory-gpu/src/host.rs,crates/victory-gpu/src/memory.rs') { throw "Unexpected probe files $files" }
+      - name: Read the two directory words through actual D3D12 submissions
+        shell: pwsh
+        run: |
+          Remove-Item Env:VICTORY_GPU_TIMING -ErrorAction SilentlyContinue
+          cargo test --locked -p victory-gpu --features diagnostics --lib memory::tests::closed_lists_can_see_directory_entries_published_by_later_recording -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
