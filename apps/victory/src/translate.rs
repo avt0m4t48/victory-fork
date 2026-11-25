@@ -152,6 +152,21 @@ struct Checks {
     host: Option<(Host, emit::HostShader)>,
 }
 
+fn shader_files(root: &Path) -> impl Iterator<Item = walkdir::DirEntry> {
+    walkdir::WalkDir::new(root)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            let kind = entry.file_type();
+            if kind.is_symlink() {
+                // Inspect the target without changing which directories WalkDir traverses.
+                return std::fs::metadata(entry.path())
+                    .is_ok_and(|target| target.is_file() && target.len() <= MAX_FILE);
+            }
+            kind.is_file() && entry.metadata().map_or(0, |m| m.len()) <= MAX_FILE
+        })
+}
+
 /// `translate --warm <file>`: the containers whose hash the file names are
 /// translated into the run's shader cache, on `jobs` threads; nothing is
 /// made on the GPU. A run of the title then finds them there instead of
@@ -182,10 +197,7 @@ pub fn warm(paths: Vec<PathBuf>, file: &Path, jobs: Option<usize>) -> Result<()>
     let done = Mutex::new(HashSet::new());
     let counts = [const { AtomicUsize::new(0) }; 5];
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root).into_iter().filter_map(Result::ok) {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
+        for entry in shader_files(root) {
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
@@ -270,13 +282,7 @@ pub fn run(
     let seen = Mutex::new(HashSet::new());
     let total = Mutex::new(Tally::default());
     for root in &paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-        {
-            if !entry.file_type().is_file() || entry.metadata().map_or(0, |m| m.len()) > MAX_FILE {
-                continue;
-            }
+        for entry in shader_files(root) {
             let Ok(data) = std::fs::read(entry.path()) else {
                 continue;
             };
