@@ -844,6 +844,35 @@ fn same_as_console(got: &[u32], want: &[u32]) {
     }
 }
 
+#[test]
+fn paired_wave_readback_preserves_three_dimensional_thread_ids() {
+    for [width, height, depth] in [[8u32, 4, 2], [4, 4, 8]] {
+        let mut words = vec![
+            vop2(0x1A, 3, k(width.trailing_zeros()), 1), // v3 = y * width
+            vop2(0x25, 3, v(0), 3), // v3 += x
+            vop2(0x1A, 4, k((width * height).trailing_zeros()), 2), // v4 = z * width * height
+            vop2(0x25, 3, v(4), 3), // v3 is the flat index
+            vop2(0x1A, 15, k(4), 3), // byte address of the lane's four dwords
+        ];
+        for reg in 0..4 {
+            words.extend(store(reg, 15, 4 * reg));
+        }
+        let threads = width * height * depth;
+        let mut native = native_of(&words, true, threads);
+        let StageIo::Cs(cs) = &mut native.io else { unreachable!() };
+        cs.threads = [width, height, depth];
+        cs.rsrc2 |= 2 << 11; // X/Y/Z thread IDs in v0/v1/v2
+
+        let shader = paired(&native);
+        let got = run_paired(&shader, [0; 4], threads * 4).expect("a real D3D12 readback");
+        let expected: Vec<u32> = (0..threads)
+            .flat_map(|i| [i % width, i / width % height, i / (width * height), i])
+            .collect();
+        same_as_console(&got, &expected);
+        eprintln!("read all {threads} lanes of a {width}x{height}x{depth} group");
+    }
+}
+
 /// One console wave of 64 threads with 256 bytes of LDS. The even lanes write their dword in
 /// one arm of a per-lane branch; the odd lanes theirs in the other arm, then, in that arm and
 /// with no barrier, read their mirror lane's (63 - n, an even lane's); the even lanes read
