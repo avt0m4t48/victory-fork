@@ -1,0 +1,59 @@
+name: Ready queues before forced waits on current main
+on:
+  push:
+    branches: [verify/pr-216-current-main]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 18
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_WAIT_FORCE: '1'
+      VICTORY_LATE_WAIT: '0'
+      VICTORY_ASYNC_SUBMIT: '0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Confirm exact PR source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne 'db3d91e890b03aa745ceebfdc6e134de8fd7b50d') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-pr-216-current-main.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the patched queue tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p victory-gpu --features diagnostics --lib queue::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:VICTORY_LATE_WAIT='3'
+          $env:VICTORY_ASYNC_SUBMIT='1'
+          cargo test --locked -p victory-gpu --features diagnostics --lib present_runs_ready_fence_producer_before_blocked_consumer -- --test-threads=1
+      - name: Reproduce the wrong fence order on main
+        shell: pwsh
+        run: |
+          $path='crates/victory-gpu/src/queue.rs'
+          $source=(Get-Content -Raw $path).Replace("`r`n", "`n")
+          $marker="    /// The title's compute queue:"
+          $start=$source.IndexOf("    #[cfg(windows)]`n    #[test]`n    fn present_runs_ready_fence_producer_before_blocked_consumer")
+          $end=$source.IndexOf($marker, $start)
+          if ($start -lt 0 -or $end -le $start) { throw 'Could not extract regression' }
+          $test=$source.Substring($start, $end-$start)
+          git checkout --detach 0b0074e0b2765e574c622e9a3de566f20f04135b
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $old=(Get-Content -Raw $path).Replace("`r`n", "`n")
+          if ($old.Contains('fn present_runs_ready_fence_producer_before_blocked_consumer') -or -not $old.Contains($marker)) { throw 'Unexpected baseline source' }
+          [IO.File]::WriteAllText((Join-Path $PWD $path), $old.Replace($marker, $test+$marker))
+          $ErrorActionPreference='Continue'
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib present_runs_ready_fence_producer_before_blocked_consumer -- --test-threads=1 2>&1
+          $code=$LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log=$output | Out-String
+          if ($code -ne 101 -or $log -notmatch 'panicked at' -or $log -notmatch 'the consumer must signal after the producer' -or $log -notmatch 'left:\s*1') { throw "Expected the old fence order, code $code" }
+          Write-Output 'Confirmed the old queue forced the consumer before the ready producer'
+          $env:VICTORY_WAIT_FORCE='0'
+          cargo test --locked -p victory-gpu --features diagnostics --lib present_runs_ready_fence_producer_before_blocked_consumer -- --test-threads=1
