@@ -1,0 +1,76 @@
+name: Mesh linkage readback probe
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [probe/mesh-link-283]
+
+permissions:
+  contents: read
+
+jobs:
+  readback:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      - name: Compile synthetic shaders and run the native WARP test
+        shell: pwsh
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'mesh-link-probe'
+          New-Item -ItemType Directory -Path $work | Out-Null
+
+          $dxcZip = Join-Path $work 'dxc.zip'
+          $dxcUri = 'https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.9.2609/dxc_2026_09_29.zip'
+          Invoke-WebRequest -Uri $dxcUri -OutFile $dxcZip
+          $dxcSha256 = 'ad31b1fc8443175d204f77a611fdb3ef2ec42759bdc2f1167368de24a4a7e7f1'
+          if ((Get-FileHash -Path $dxcZip -Algorithm SHA256).Hash -ne $dxcSha256) {
+            throw 'DXC checksum mismatch'
+          }
+          $dxcDir = Join-Path $work 'dxc'
+          Expand-Archive -Path $dxcZip -DestinationPath $dxcDir
+          $dxc = Join-Path $dxcDir 'bin/x64/dxc.exe'
+          $source = 'crates/victory-shader/src/emit/mesh_link.hlsl'
+          $env:VICTORY_MESH_LINK_DXIL = Join-Path $work 'dxil'
+          New-Item -ItemType Directory -Path $env:VICTORY_MESH_LINK_DXIL | Out-Null
+          foreach ($mode in 0, 1) {
+            foreach ($entry in 'mesh', 'pixel', 'pixel_flat') {
+              $profile = if ($entry -eq 'mesh') { 'ms_6_6' } else { 'ps_6_6' }
+              $output = Join-Path $env:VICTORY_MESH_LINK_DXIL "$mode-$entry.dxil"
+              & $dxc -T $profile -E $entry -D "PACKED=$mode" -Fo $output $source
+              if ($LASTEXITCODE -ne 0) { throw "DXC failed for $mode-$entry" }
+            }
+          }
+
+          $warpZip = Join-Path $work 'warp.zip'
+          $warpVersion = '1.0.22'
+          $warpUri = "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/$warpVersion/microsoft.direct3d.warp.$warpVersion.nupkg"
+          Invoke-WebRequest -Uri $warpUri -OutFile $warpZip
+          $warpSha512 = '9b19c3cc108a3eacf0630c65bd61f21feaa348148f08379c1d55c8d205ec7ea1232181fec97f68617e9540256a8c4a50515b70ad018206bde156b4170d47d0d7'
+          if ((Get-FileHash -Path $warpZip -Algorithm SHA512).Hash -ne $warpSha512) {
+            throw 'WARP checksum mismatch'
+          }
+          $warpDir = Join-Path $work 'warp'
+          Expand-Archive -Path $warpZip -DestinationPath $warpDir
+
+          $build = cargo test -p victory-shader --lib --locked --no-run --message-format=json
+          if ($LASTEXITCODE -ne 0) { throw 'failed to build the shader tests' }
+          $exes = @($build | ConvertFrom-Json | Where-Object {
+            $_.reason -eq 'compiler-artifact' -and $_.target.name -eq 'victory_shader' -and
+              $_.profile.test -and $_.executable
+          } | Select-Object -ExpandProperty executable)
+          if ($exes.Count -ne 1) { throw "expected one shader test executable, found $($exes.Count)" }
+          $exe = $exes[0]
+          $warp = Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll'
+          Write-Host "WARP package $warpVersion, DLL version $((Get-Item $warp).VersionInfo.FileVersion)"
+          Copy-Item -LiteralPath $warp -Destination (Split-Path -Parent $exe)
+          $test = 'emit::mesh_link_tests::packed_mesh_halves_are_decoded_before_pixel_interpolation'
+          $listed = & $exe --ignored --exact $test --list
+          if ($LASTEXITCODE -ne 0 -or $listed -notcontains "${test}: test") {
+            throw "native readback test was not found: $test"
+          }
+          & $exe --ignored --exact $test --nocapture
+          if ($LASTEXITCODE -ne 0) { throw "native WARP readback failed ($LASTEXITCODE)" }

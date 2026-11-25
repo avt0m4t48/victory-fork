@@ -727,6 +727,7 @@ impl Host {
                 .map_err(err)?;
             let rtv = rtv_heap.GetCPUDescriptorHandleForHeapStart();
             dev.CreateRenderTargetView(&target, None, rtv);
+            list.ClearRenderTargetView(rtv, &[0.0; 4], None);
             let views: ID3D12DescriptorHeap = dev
                 .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                     Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,

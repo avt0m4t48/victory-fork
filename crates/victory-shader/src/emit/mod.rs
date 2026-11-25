@@ -89,6 +89,8 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+#[cfg(all(test, windows))]
+mod mesh_link_tests;
 mod own_bits;
 mod rect;
 mod sampler;
