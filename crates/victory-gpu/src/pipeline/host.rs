@@ -17,6 +17,15 @@ use windows::core::PCSTR;
 use super::{Shader, Translated};
 use crate::host::host;
 
+/// Whether a title pipeline that enables the depth bounds test gets it on
+/// the host (`VICTORY_DEPTH_BOUNDS=0`: never, as before the test was
+/// supported). For telling whether objects that go missing are cut by the
+/// bounds: doors were gone in run vg31, the first with the test.
+fn depth_bounds_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_DEPTH_BOUNDS").is_none_or(|v| v != "0"))
+}
+
 /// A stream's graphics state, owned (the title's stream lives only for the
 /// creation call). Subobjects the stream leaves out keep D3D12's defaults.
 pub(crate) struct GraphicsState {
@@ -111,7 +120,7 @@ impl GraphicsState {
                 }
                 21 => {
                     let d = data.cast::<D3D12_DEPTH_STENCIL_DESC1>().read_unaligned();
-                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool();
+                    self.depth_bounds = d.DepthBoundsTestEnable.as_bool() && depth_bounds_on();
                     self.depth = D3D12_DEPTH_STENCIL_DESC {
                         DepthEnable: d.DepthEnable,
                         DepthWriteMask: d.DepthWriteMask,
