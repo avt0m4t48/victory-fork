@@ -40,7 +40,8 @@ pub(crate) fn counts() -> (u64, u64) {
 
 /// What identifies this build's translations: the translator's fingerprint
 /// (`build.rs`: its sources, this file, the lock file, the compiler and the
-/// build's features), what the host told the translator about itself, and
+/// profile; diagnostics and plain builds share it), what the host told the
+/// translator about itself, and
 /// the translation settings it runs with (the loop limit, which a
 /// diagnostics build can change at run time). With
 /// `VICTORY_SHADER_CACHE_KEY=exe` the executable's own bytes stand in for

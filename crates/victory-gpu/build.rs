@@ -1,7 +1,7 @@
 //! The translator's fingerprint, for the shader cache's key (`shader_cache::build`): a hash of
 //! what decides a translation and how it is stored (the `victory-shader` and `victory-pipeline`
-//! sources, `shader_cache.rs`, the workspace's manifest and lock file, the compiler, this build's
-//! features). A rebuild that leaves all of it alone keeps the translations cached so far; one that
+//! sources, `shader_cache.rs`, the workspace's manifest and lock file, the compiler, the
+//! profile). A rebuild that leaves all of it alone keeps the translations cached so far; one that
 //! changes any of it never reads them. Keyed by the executable's own hash, as before, every
 //! rebuild started cold: some 2,800 translations again, and the first run after it stuttered.
 
@@ -62,6 +62,10 @@ fn main() {
     let version = std::process::Command::new(rustc).arg("-vV").output().map(|o| o.stdout).unwrap_or_default();
     h.feed(&version);
     h.feed(std::env::var("PROFILE").unwrap_or_default().as_bytes());
-    h.feed(if std::env::var_os("CARGO_FEATURE_DIAGNOSTICS").is_some() { b"diagnostics" } else { b"plain" });
+    // Not the `diagnostics` feature: in the translator it only lets
+    // VICTORY_SHADER_LOOP_LIMIT change the loop limit, whose value the key
+    // holds anyway (`shader_cache::build`). So a diagnostics build and a
+    // plain one share their translations, and a scripted run of the one
+    // (which can press through the menus) warms the other's cache.
     println!("cargo:rustc-env=VICTORY_TRANSLATOR_FINGERPRINT={:016x}{:016x}", h.0, h.1);
 }
