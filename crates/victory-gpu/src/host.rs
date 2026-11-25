@@ -1927,6 +1927,12 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// Directory versions bound by this recording, kept through execution.
+    memory_directories: Vec<ID3D12Resource>,
+    memory_faults: Option<ID3D12Resource>,
+    /// Number of copies already scheduled for refresh and write-back.
+    memory_reads: usize,
+    memory_writes: usize,
     /// Buffer ranges refreshed since the last title copy (host copy,
     /// address, bytes): refreshing them again would find the same bytes.
     refreshed: std::collections::HashSet<(usize, usize, usize)>,
@@ -6508,6 +6514,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.memory_directories.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty())
@@ -6881,6 +6888,27 @@ impl HostList {
         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
             self.deferred().kept.push(object);
         }
+    }
+
+    pub(crate) fn cover_title_memory(
+        &self,
+        directory: &ID3D12Resource,
+        faults: &ID3D12Resource,
+        copies: usize,
+        writes: bool,
+    ) -> (usize, usize) {
+        let mut deferred = self.deferred();
+        if deferred.memory_directories.last() != Some(directory) {
+            deferred.memory_directories.push(directory.clone());
+        }
+        deferred.memory_faults.get_or_insert_with(|| faults.clone());
+        let read_from = std::mem::replace(&mut deferred.memory_reads, copies);
+        let write_from = if writes {
+            std::mem::replace(&mut deferred.memory_writes, copies)
+        } else {
+            copies
+        };
+        (read_from, write_from)
     }
 
     /// Whether this is the first time since the reset that the list asks

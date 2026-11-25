@@ -15,6 +15,8 @@ use crate::host::host;
 
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
+    /// Base slot and installed copy count for title memory by address.
+    pub(crate) memory_run: Mutex<Option<(u32, usize)>>,
     cpu: usize,
     step: u32,
     /// Slots mirroring the title's; view heaps have `dynamic` more.
@@ -952,6 +954,7 @@ impl HostHeap {
             sampler,
             made: Mutex::new(vec![0; count as usize]),
             copied: Mutex::new(Vec::new()),
+            memory_run: Mutex::default(),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),

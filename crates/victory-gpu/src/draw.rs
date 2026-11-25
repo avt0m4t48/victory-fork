@@ -1210,8 +1210,8 @@ impl State {
                     if srv && slot == victory_shader::emit::SLOT_MEMORY {
                         // Ours: the directory of title memory by address.
                         if let Some(m) = &memory {
-                            // SAFETY: an open list; the directory lives as
-                            // long as the process and the list holds it.
+                            // SAFETY: an open list that holds this directory
+                            // version until reset.
                             unsafe {
                                 if compute {
                                     l.SetComputeRootShaderResourceView(param, m.directory);

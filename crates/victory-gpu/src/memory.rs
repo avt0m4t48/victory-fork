@@ -11,8 +11,8 @@
 //!
 //! - the **directory**: per 64 KiB page of title address space the number
 //!   of the copy that holds the page (0: none) and the page's byte offset
-//!   in it; one buffer for all lists, entries only ever go from empty to
-//!   filled;
+//!   in it; immutable versions shared by recordings that see the same
+//!   mappings. A later discovery never changes an already bound version;
 //! - per view heap a run of slots with a raw unordered access view of each
 //!   numbered copy (slot 0 of the run: a null view, for pages without a
 //!   copy);
@@ -63,14 +63,12 @@ const CELL: u64 = 4 << 20;
 const PAGE: u64 = 1 << 16;
 
 struct Memory {
-    /// Buffer, its mapping, its GPU address.
-    directory: (ID3D12Resource, *mut u32, u64),
+    /// Authoritative page mappings and their latest GPU-visible version.
+    pages: HashMap<u64, [u32; 2]>,
+    directory: Option<(ID3D12Resource, u64)>,
     faults: (ID3D12Resource, *mut u32, u64),
     /// Copy `n` is `copies[n - 1]`.
     copies: Vec<Arc<Shadow>>,
-    /// Per host view heap (by address): the first slot of its run, and how
-    /// many copies have their view there.
-    heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
@@ -105,10 +103,10 @@ impl Memory {
         };
         tracing::info!("title memory by address: a shader reads or writes through raw addresses");
         Some(Memory {
-            directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+            pages: HashMap::new(),
+            directory: None,
             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
             copies: Vec::new(),
-            heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
         })
@@ -122,10 +120,7 @@ impl Memory {
         if page >= u64::from(MEMORY_PAGES) - 1 {
             return;
         }
-        // SAFETY: inside the directory's mapping.
-        let entry = unsafe { self.directory.1.add(page as usize * 2) };
-        // SAFETY: as above.
-        if unsafe { entry.read() } != 0 {
+        if self.pages.contains_key(&page) {
             return;
         }
         let start = page * PAGE;
@@ -164,15 +159,9 @@ impl Memory {
                 let (first, len) = shadow.span();
                 let mut at = first.next_multiple_of(PAGE);
                 while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
-                    // SAFETY: inside the directory's mapping.
-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
-                    // SAFETY: as above; the offset first, as below.
-                    unsafe {
-                        if other.read() == 0 {
-                            other.add(1).write_volatile((at - first) as u32);
-                            other.write_volatile(n as u32 + 1);
-                        }
-                    }
+                    self.pages
+                        .entry(at / PAGE)
+                        .or_insert([n as u32 + 1, (at - first) as u32]);
                     at += PAGE;
                 }
                 n
@@ -186,12 +175,30 @@ impl Memory {
             }
         };
         let offset = shadow.offset_in(start).unwrap_or(0);
-        // The offset first: a shader that sees the number sees it too.
-        // SAFETY: inside the directory's mapping.
-        unsafe {
-            entry.add(1).write_volatile(offset as u32);
-            entry.write_volatile(n as u32 + 1);
+        self.pages.insert(page, [n as u32 + 1, offset as u32]);
+        self.directory = None;
+    }
+
+    /// Creates a new version only after discovery changes the directory.
+    /// Once bound by a recording, the resource is never written again.
+    fn directory(&mut self) -> Option<&(ID3D12Resource, u64)> {
+        if self.directory.is_none() {
+            let size = u64::from(MEMORY_PAGES) * 8;
+            let (buffer, data) = host()?.shared_buffer(size)?;
+            crate::host::name(&buffer, || "title memory by address: directory".to_owned());
+            // SAFETY: the fresh mapping is aligned and covers all directory entries.
+            // The GPU cannot see the resource until its initialization is complete.
+            let gpu = unsafe {
+                std::ptr::write_bytes(data, 0, size as usize);
+                let entries = data.cast::<[u32; 2]>();
+                for (&page, &entry) in &self.pages {
+                    entries.add(page as usize).write(entry);
+                }
+                buffer.GetGPUVirtualAddress()
+            };
+            self.directory = Some((buffer, gpu));
         }
+        self.directory.as_ref()
     }
 
     /// The pages shaders found empty since the last frame.
@@ -257,7 +264,6 @@ pub(crate) fn ready(
         m.refused.clear();
         m.take_faults();
     }
-    let numbered = m.copies.len();
     for &address in addresses {
         m.name(address);
     }
@@ -275,44 +281,35 @@ pub(crate) fn ready(
             m.name(u64::from(c) << 8);
         }
     }
-    let key = std::ptr::from_ref(heap) as usize;
-    let (base, made) = match m.heaps.get(&key) {
-        Some(&run) => run,
-        None => {
-            // Held for the heap's life: not given back with a list's slots.
-            let base = heap.dynamic(COPIES + 1)?;
-            heap.null_raw_uav_at(base);
-            (base, 0)
-        }
-    };
-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (_, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+    let (directory, gpu) = m.directory()?.clone();
+    let mut run = heap.memory_run.lock().unwrap_or_else(|e| e.into_inner());
+    if run.is_none() {
+        let base = heap.dynamic(COPIES + 1)?;
+        heap.null_raw_uav_at(base);
+        *run = Some((base, 0));
     }
-    m.heaps.insert(key, (base, m.copies.len() as u32));
-    // Once per list, and for copies numbered since: the builder alone
-    // dispatches hundreds of times a frame.
-    // shortcut: a copy another list numbers meanwhile is brought up to date
-    // by that list's submission, which may run after this one's.
-    const READ: usize = usize::MAX - 0x6d;
-    const WRITE: usize = usize::MAX - 0x6e;
-    let first_read = list.first_use(READ);
-    let first_write = writes && list.first_use(WRITE);
-    for (n, shadow) in m.copies.iter().enumerate() {
+    let (base, made) = run.as_mut()?;
+    for (n, shadow) in m.copies.iter().enumerate().skip(*made) {
+        let (_, len) = shadow.span();
+        heap.raw_uav_at(*base + 1 + n as u32, &shadow.buffer, 0, len);
+    }
+    *made = m.copies.len();
+    let base = *base;
+    drop(run);
+
+    let (read_from, write_from) =
+        list.cover_title_memory(&directory, &m.faults.0, m.copies.len(), writes);
+    for (n, shadow) in m.copies.iter().enumerate().skip(read_from.min(write_from)) {
         let (start, len) = shadow.span();
-        if first_read || n >= numbered {
+        if n >= read_from {
             shadow.refresh(list, start, len);
         }
-        if writes && (first_write || n >= numbered) {
+        if n >= write_from {
             shadow.gpu_writes(list, start, len);
         }
     }
-    if first_read {
-        list.keep(&m.directory.0);
-        list.keep(&m.faults.0);
-    }
     Some(Ready {
-        directory: m.directory.2,
+        directory: gpu,
         faults: m.faults.2,
         base,
     })
@@ -326,7 +323,7 @@ mod tests {
     };
 
     #[test]
-    fn closed_lists_can_see_directory_entries_published_by_later_recording() {
+    fn closed_lists_hold_the_directory_version_they_recorded() {
         let host = host().expect("WARP is required for this probe");
         let candidate = (0..16)
             .map(|slot| 0x4_2000_0000 + slot * CELL)
@@ -341,20 +338,21 @@ mod tests {
         crate::shadow::register(1, address, PAGE);
         let heap_a = HostHeap::new(false, 1).unwrap();
         let heap_b = HostHeap::new(false, 1).unwrap();
-        let key_a = std::ptr::from_ref(&heap_a) as usize;
-        let key_b = std::ptr::from_ref(&heap_b) as usize;
-
+        let copy_directory = |list: &HostList, binding: Ready| {
+            let target = host.read_back_buffer(8).unwrap();
+            let guard = MEMORY.lock().unwrap();
+            let (directory, gpu) = guard.as_ref().unwrap().directory.as_ref().unwrap();
+            assert_eq!(binding.directory, *gpu);
+            // SAFETY: open list; copy the two directory words using valid resources.
+            unsafe {
+                list.list.CopyBufferRegion(&target, 0, directory, address / PAGE * 8, 8)
+            };
+            target
+        };
         let record = || {
             let list = host.new_list().unwrap();
             let binding = ready(&list, &heap_a, &[], &[], true).unwrap();
-            let target = host.read_back_buffer(8).unwrap();
-            {
-                let guard = MEMORY.lock().unwrap();
-                let directory = &guard.as_ref().unwrap().directory;
-                assert_eq!(binding.directory, directory.2);
-                // SAFETY: open list; copy the two directory words using valid resources.
-                unsafe { list.list.CopyBufferRegion(&target, 0, &directory.0, address / PAGE * 8, 8) };
-            }
+            let target = copy_directory(&list, binding);
             list.close();
             (list, target)
         };
@@ -374,32 +372,44 @@ mod tests {
         host.execute(&[&control]);
         assert_eq!(read(&control_target), [0, 0]);
 
+        let continuing = host.new_list().unwrap();
+        let old_binding = ready(&continuing, &heap_a, &[], &[], true).unwrap();
+        let old_target = copy_directory(&continuing, old_binding);
+
         let discover = host.new_list().unwrap();
         let new_binding = ready(&discover, &heap_b, &[address], &[], true).unwrap();
         discover.close();
         assert_eq!(discover.test_shadow_steps(address as usize), (true, true));
-        {
-            let guard = MEMORY.lock().unwrap();
-            let memory = guard.as_ref().unwrap();
-            assert_eq!(memory.heaps[&key_a].1, 0);
-            assert_eq!(memory.heaps[&key_b], (new_binding.base, 1));
-        }
+        assert_eq!(heap_a.memory_run.lock().unwrap().unwrap().1, 0);
+        assert_eq!(*heap_b.memory_run.lock().unwrap(), Some((new_binding.base, 1)));
+
         host.execute(&[&different_heap]);
-        assert_eq!(read(&different_target), [1, 0]);
+        assert_eq!(read(&different_target), [0, 0]);
         assert_eq!(different_heap.test_shadow_steps(address as usize), (false, false));
-        eprintln!("WARP copied directory [1, 0] from an earlier list whose separate heap had 0 installed copies");
+        eprintln!("Closed list on a separate heap retained [0, 0] with zero installed copies");
 
-        let install = host.new_list().unwrap();
-        ready(&install, &heap_a, &[address], &[], true).unwrap();
-        install.close();
-        assert_eq!(install.test_shadow_steps(address as usize), (true, true));
-        assert_eq!(MEMORY.lock().unwrap().as_ref().unwrap().heaps[&key_a].1, 1);
+        // This list had already called ready before another list discovered
+        // the copy. It must cover that copy when it binds the new version.
+        let binding = ready(&continuing, &heap_a, &[], &[], false).unwrap();
+        assert_eq!(binding.directory, new_binding.directory);
+        assert_eq!(continuing.test_shadow_steps(address as usize), (true, false));
+        let binding = ready(&continuing, &heap_a, &[], &[], true).unwrap();
+        let new_target = copy_directory(&continuing, binding);
+        continuing.close();
+        assert_eq!(continuing.test_shadow_steps(address as usize), (true, true));
+        assert_eq!(heap_a.memory_run.lock().unwrap().unwrap().1, 1);
+
         host.execute(&[&same_heap]);
-        assert_eq!(read(&same_target), [1, 0]);
+        assert_eq!(read(&same_target), [0, 0]);
         assert_eq!(same_heap.test_shadow_steps(address as usize), (false, false));
-        eprintln!("same heap had copy #1 installed, while the earlier list still had neither refresh nor write-back coverage");
+        eprintln!("Closed list on the shared heap retained [0, 0] after copy 1 was installed");
 
-        drop((control, different_heap, same_heap, discover, install));
+        host.execute(&[&continuing]);
+        assert_eq!(read(&old_target), [0, 0]);
+        assert_eq!(read(&new_target), [1, 0]);
+        eprintln!("One recording read both versions and declared the new copy for refresh and write-back");
+
+        drop((control, different_heap, same_heap, discover, continuing));
         MEMORY.lock().unwrap().take();
         crate::shadow::unregister(1, address);
         // SAFETY: release only the probe's private allocation.
