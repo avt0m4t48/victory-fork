@@ -89,9 +89,12 @@ mod intersect_tests;
 #[cfg(all(windows, any(test, feature = "host")))]
 pub mod host;
 mod lower;
+mod mesh_pack;
 #[cfg(all(test, windows))]
 mod mesh_link_tests;
 mod own_bits;
+#[cfg(test)]
+mod packed_mesh_tests;
 mod rect;
 mod sampler;
 mod shader;
@@ -113,6 +116,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 pub use bitcode::census;
 pub use sampler::StaticSampler;
 pub use lower::set_host_max_wave;
+pub use mesh_pack::{PackedMesh, PackedStage, pack_mesh_outputs};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -274,10 +278,15 @@ pub struct UserData {
 /// shader container.
 pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
     let c = Container::parse(container)?;
+    let native = executable_program(&c)?;
+    emit_translated(&c, &native, &[])
+}
+
+fn executable_program(c: &Container<'_>) -> Result<NativeProgram, ShaderError> {
     let dxil = c
         .part(FourCC::DXIL)
         .ok_or(ShaderError::Malformed("no DXIL part"))?;
-    let native = crate::native_programs(dxil.data)?
+    crate::native_programs(dxil.data)?
         .into_iter()
         .find(|p| {
             matches!(
@@ -288,15 +297,26 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
         .ok_or(ShaderError::Unsupported {
             offset: 0,
             what: "a container without a vertex, pixel, compute or mesh program",
-        })?;
-    let p = crate::spill::build(&native)?;
+        })
+}
+
+fn emit_translated(
+    c: &Container<'_>,
+    native: &NativeProgram,
+    packed: &[usize],
+) -> Result<HostShader, ShaderError> {
+    let p = crate::spill::build(native)?;
     // Structurisation first: tracing per-lane descriptors needs it (its
     // failure is reported after the earlier stages').
     let st = structure::structure(&p);
     let res = resource::track(&p, &native.layout, native.stage, st.as_ref().ok())?;
-    let io = io::raise(&p, &native)?;
+    let io = io::raise(&p, native)?;
     let st = st?;
-    emit(&c, &native, &p, &st, &io, &res)
+    if packed.is_empty() {
+        emit(c, native, &p, &st, &io, &res)
+    } else {
+        emit_program_with_packing(c, native, &p, &st, &io, &res, packed).map(|(shader, _)| shader)
+    }
 }
 
 /// Emits a program whose earlier stages already ran.
@@ -570,6 +590,18 @@ fn emit_program(
     io: &io::Io,
     res: &resource::Resources,
 ) -> Result<(HostShader, Option<u32>), ShaderError> {
+    emit_program_with_packing(c, native, p, st, io, res, &[])
+}
+
+fn emit_program_with_packing(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    packed: &[usize],
+) -> Result<(HostShader, Option<u32>), ShaderError> {
     let sig = |fourcc| -> Result<Vec<container::SigElement>, ShaderError> {
         match c.part(fourcc) {
             Some(part) => signature(part.data),
@@ -627,7 +659,7 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
+    let parts = lower::Parts {
         native,
         p,
         st,
@@ -637,7 +669,12 @@ fn emit_program(
         outputs,
         prims,
         mesh_stride,
-    })?;
+    };
+    let l = if packed.is_empty() {
+        lower::lower(&parts)?
+    } else {
+        lower::lower_with_packed_varyings(&parts, packed)?
+    };
     let wave_size = l.wave_size;
     let shader = HostShader {
         stage: native.stage,

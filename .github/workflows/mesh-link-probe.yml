@@ -33,6 +33,7 @@ jobs:
           $dxcDir = Join-Path $work 'dxc'
           Expand-Archive -Path $dxcZip -DestinationPath $dxcDir
           $dxc = Join-Path $dxcDir 'bin/x64/dxc.exe'
+          $env:VICTORY_DXIL = Join-Path $dxcDir 'bin/x64/dxil.dll'
           $source = 'crates/victory-shader/src/emit/mesh_link.hlsl'
           $env:VICTORY_MESH_LINK_DXIL = Join-Path $work 'dxil'
           New-Item -ItemType Directory -Path $env:VICTORY_MESH_LINK_DXIL | Out-Null
@@ -43,6 +44,16 @@ jobs:
               & $dxc -T $profile -E $entry -D "PACKED=$mode" -Fo $output $source
               if ($LASTEXITCODE -ne 0) { throw "DXC failed for $mode-$entry" }
             }
+          }
+
+          $nativeSource = 'crates/victory-shader/tests/mesh_link'
+          $env:VICTORY_MESH_LINK_NATIVE = Join-Path $work 'native'
+          New-Item -ItemType Directory -Path $env:VICTORY_MESH_LINK_NATIVE | Out-Null
+          foreach ($mode in 'mesh', 'mesh-control', 'pixel-flat', 'pixel-center') {
+            $input = Join-Path $nativeSource "$mode.hex"
+            $output = Join-Path $env:VICTORY_MESH_LINK_NATIVE "$mode.cdxil"
+            python (Join-Path $nativeSource 'make_container.py') $mode $input $output
+            if ($LASTEXITCODE -ne 0) { throw "fixture creation failed for $mode" }
           }
 
           $warpZip = Join-Path $work 'warp.zip'
@@ -67,10 +78,15 @@ jobs:
           $warp = Join-Path $warpDir 'build/native/bin/x64/d3d10warp.dll'
           Write-Host "WARP package $warpVersion, DLL version $((Get-Item $warp).VersionInfo.FileVersion)"
           Copy-Item -LiteralPath $warp -Destination (Split-Path -Parent $exe)
-          $test = 'emit::mesh_link_tests::packed_mesh_halves_are_decoded_before_pixel_interpolation'
-          $listed = & $exe --ignored --exact $test --list
-          if ($LASTEXITCODE -ne 0 -or $listed -notcontains "${test}: test") {
-            throw "native readback test was not found: $test"
+          $tests = @(
+            'emit::mesh_link_tests::packed_mesh_halves_are_decoded_before_pixel_interpolation',
+            'emit::mesh_link_tests::fork_emitted_mesh_pairs_match_unpacked_readback'
+          )
+          foreach ($test in $tests) {
+            $listed = & $exe --ignored --exact $test --list
+            if ($LASTEXITCODE -ne 0 -or $listed -notcontains "${test}: test") {
+              throw "native readback test was not found: $test"
+            }
+            & $exe --ignored --exact $test --nocapture
+            if ($LASTEXITCODE -ne 0) { throw "native WARP readback failed ($LASTEXITCODE)" }
           }
-          & $exe --ignored --exact $test --nocapture
-          if ($LASTEXITCODE -ne 0) { throw "native WARP readback failed ($LASTEXITCODE)" }

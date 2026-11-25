@@ -11,6 +11,12 @@ use super::host::{Draw, Host};
 
 const SIZE: usize = 16;
 const EPSILON: f32 = 0.001;
+const PERSPECTIVE_ORACLE: [(usize, usize, f32, f32); 4] = [
+    (3, 10, -1.213_768_1, 0.362_318_84),
+    (6, 10, 0.425_438_6, -0.614_035_07),
+    (3, 5, -0.160_256_42, 0.897_435_9),
+    (8, 12, 1.069_672_1, -1.295_082),
+];
 
 fn report_warp_capabilities(host: &Host) {
     let mut shader_model = D3D12_FEATURE_DATA_SHADER_MODEL {
@@ -107,6 +113,36 @@ fn assert_pixel(actual: [f32; 4], expected: [f32; 4], label: &str, index: usize)
     );
 }
 
+fn render_pair(
+    host: &Host,
+    root: &ID3D12RootSignature,
+    label: &str,
+    ms: &[u8],
+    ps: &[u8],
+) -> Vec<[f32; 4]> {
+    let pso = host
+        .mesh_pipeline_with(root, ms, ps)
+        .unwrap_or_else(|error| panic!("{label} PSO: {error}"));
+    let pixels = host
+        .draw(
+            root,
+            &pso,
+            &Draw {
+                roots: vec![],
+                textures: &[],
+                samplers: &[],
+                vertices: &[],
+                stride: 0,
+                size: (SIZE as u32, SIZE as u32),
+                mesh_groups: 1,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{label} draw: {error}"));
+    assert_eq!(pixels.len(), SIZE * SIZE);
+    assert_eq!(pixels[0], [0.0; 4], "{label} outside the triangle");
+    pixels
+}
+
 #[test]
 #[ignore = "requires public DXC fixtures and pinned app-local WARP"]
 fn packed_mesh_halves_are_decoded_before_pixel_interpolation() {
@@ -120,36 +156,12 @@ fn packed_mesh_halves_are_decoded_before_pixel_interpolation() {
     let split_ps = bytecode(fixture_dir, "0-pixel");
 
     let root = host.root_signature_for(&[]).expect("create root signature");
-    let draw = |label, ms, ps| {
-        let pso = host
-            .mesh_pipeline_with(&root, ms, ps)
-            .unwrap_or_else(|error| panic!("{label} PSO: {error}"));
-        let pixels = host
-            .draw(
-                &root,
-                &pso,
-                &Draw {
-                    roots: vec![],
-                    textures: &[],
-                    samplers: &[],
-                    vertices: &[],
-                    stride: 0,
-                    size: (SIZE as u32, SIZE as u32),
-                    mesh_groups: 1,
-                },
-            )
-            .unwrap_or_else(|error| panic!("{label} draw: {error}"));
-        assert_eq!(pixels.len(), SIZE * SIZE);
-        assert_eq!(pixels[0], [0.0; 4], "{label} outside the triangle");
-        pixels
-    };
-
-    let packed = draw("packed", &packed_ms, &packed_ps);
-    let split = draw("split", &split_ms, &split_ps);
+    let packed = render_pair(&host, &root, "packed", &packed_ms, &packed_ps);
+    let split = render_pair(&host, &root, "split", &split_ms, &split_ps);
     let packed_flat_ps = bytecode(fixture_dir, "1-pixel_flat");
     let split_flat_ps = bytecode(fixture_dir, "0-pixel_flat");
-    let packed_flat = draw("packed flat", &packed_ms, &packed_flat_ps);
-    let split_flat = draw("split flat", &split_ms, &split_flat_ps);
+    let packed_flat = render_pair(&host, &root, "packed flat", &packed_ms, &packed_flat_ps);
+    let split_flat = render_pair(&host, &root, "split flat", &split_ms, &split_flat_ps);
 
     let mut covered = 0;
     for (index, &reference) in split.iter().enumerate() {
@@ -176,12 +188,7 @@ fn packed_mesh_halves_are_decoded_before_pixel_interpolation() {
     // Independent perspective oracle. The three screen vertices are (2,14), (14,14),
     // and (2,2), with clip-space W = 1, 2, 4. Divide their screen weights by W,
     // renormalize, and apply them to the two exactly representable FP16 values.
-    for (x, y, a, b) in [
-        (3, 10, -1.213_768_1, 0.362_318_84),
-        (6, 10, 0.425_438_6, -0.614_035_07),
-        (3, 5, -0.160_256_42, 0.897_435_9),
-        (8, 12, 1.069_672_1, -1.295_082),
-    ] {
+    for (x, y, a, b) in PERSPECTIVE_ORACLE {
         let index = y * SIZE + x;
         let expected = [a, b, 0.0, 1.0];
         assert_pixel(packed[index], expected, "packed oracle", index);
@@ -194,4 +201,65 @@ fn packed_mesh_halves_are_decoded_before_pixel_interpolation() {
             .is_err(),
         "PSO accepted a pixel input whose PAIR semantic is absent from the mesh output"
     );
+}
+
+#[test]
+#[ignore = "requires synthetic native fixtures and pinned app-local WARP"]
+fn fork_emitted_mesh_pairs_match_unpacked_readback() {
+    use super::{HostShader, pack_mesh_outputs, translate, validator::Validator};
+
+    let host = Host::new(true).expect("create an SM 6.6 WARP device");
+    report_warp_capabilities(&host);
+    let dir = std::env::var_os("VICTORY_MESH_LINK_NATIVE").expect("set native fixture directory");
+    let dir = Path::new(&dir);
+    let mesh = fs::read(dir.join("mesh.cdxil")).unwrap();
+    let control = fs::read(dir.join("mesh-control.cdxil")).unwrap();
+    let root = host.root_signature_for(&[]).expect("create root signature");
+    let validator_path = Validator::default_path().expect("find DXIL validator");
+    let mut validator = Validator::load(Some(&validator_path)).expect("load DXIL validator");
+    let mut signed = |mut shader: HostShader| {
+        validator
+            .validate(&mut shader.dxil)
+            .expect("validate emitted DXIL");
+        shader.dxil
+    };
+    let split_ms = signed(translate(&control).unwrap());
+
+    for mode in ["flat", "center"] {
+        let pixel = fs::read(dir.join(format!("pixel-{mode}.cdxil"))).unwrap();
+        assert!(pack_mesh_outputs(&control, &pixel, true).is_none());
+        assert_eq!(
+            pack_mesh_outputs(&mesh, &pixel, false).is_some(),
+            mode == "flat"
+        );
+        let pair = pack_mesh_outputs(&mesh, &pixel, true).expect("matching pair");
+        assert_eq!(
+            (pair.mesh.elements(), pair.pixel.elements()),
+            (&[16][..], &[0][..])
+        );
+        let packed_ms = signed(pair.mesh.translate().unwrap());
+        let packed_ps = signed(pair.pixel.translate().unwrap());
+        let split_ps = signed(translate(&pixel).unwrap());
+        let packed = render_pair(&host, &root, "fork packed", &packed_ms, &packed_ps);
+        let split = render_pair(&host, &root, "fork split", &split_ms, &split_ps);
+        let mut covered = 0;
+        for (index, (&actual, &expected)) in packed.iter().zip(&split).enumerate() {
+            assert_eq!(actual[3], expected[3], "{mode} coverage at {index}");
+            assert_pixel(actual, expected, mode, index);
+            if expected[3] == 1.0 {
+                covered += 1;
+                if mode == "flat" {
+                    assert_eq!(actual, [-2.0, 0.5, 0.0, 1.0]);
+                }
+            }
+        }
+        assert_eq!(covered, 66, "{mode} coverage");
+        if mode == "center" {
+            for (x, y, a, b) in PERSPECTIVE_ORACLE {
+                let index = y * SIZE + x;
+                assert_pixel(packed[index], [a, b, 0.0, 1.0], mode, index);
+            }
+        }
+        eprintln!("Fork-emitted {mode}: read back {covered} matching pixels");
+    }
 }

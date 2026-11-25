@@ -87,9 +87,34 @@ enum Stop {
 }
 
 pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+    lower_with_packed_varyings(parts, &[])
+}
+
+/// `packed` identifies complete FP16 pairs by their stage signature element.
+pub(super) fn lower_with_packed_varyings(
+    parts: &Parts,
+    packed: &[usize],
+) -> Result<Lowered, ShaderError> {
+    if !packed.is_empty() {
+        let elements = match parts.native.stage {
+            HwStage::Ms => &parts.outputs[..],
+            HwStage::Ps => &parts.inputs[..],
+            _ => &[],
+        };
+        if packed.iter().any(|&id| {
+            !elements.get(id).is_some_and(|e| {
+                e.half && e.kind == 0 && e.comp == 9 && e.row.is_some() && e.cols == 2
+            })
+        }) {
+            return Err(ShaderError::Unsupported {
+                offset: 0,
+                what: "an invalid packed mesh varying",
+            });
+        }
+    }
     let mut bad = HashMap::new();
     loop {
-        match Lower::new(parts, &bad).run() {
+        match Lower::new(parts, &bad, packed).run() {
             Ok(l) => return Ok(l),
             Err(Stop::Retry(v, why)) => {
                 if bad.insert(v, why).is_some() {
@@ -180,6 +205,8 @@ fn half_shift(width: u32) -> u32 {
 struct Lower<'a> {
     s: Shader,
     x: &'a Parts<'a>,
+    /// Guest signature elements carried as one uint in the host interface.
+    packed_varyings: &'a [usize],
     bad: &'a HashMap<Value, Why>,
     lane_fail: HashMap<Value, Why>,
     vals: HashMap<Value, Val>,
@@ -1226,7 +1253,7 @@ fn unsupported(offset: usize, what: Why) -> Stop {
 }
 
 impl<'a> Lower<'a> {
-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
+    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, packed: &'a [usize]) -> Self {
         let p = x.p;
         let mut phi_at = HashMap::new();
         for (b, block) in p.blocks.iter().enumerate() {
@@ -1237,6 +1264,18 @@ impl<'a> Lower<'a> {
         let mut s = Shader::new(x.native.stage == HwStage::Ps);
         s.inputs = x.inputs.clone();
         s.outputs = x.outputs.clone();
+        let packed_elements = if x.native.stage == HwStage::Ms {
+            &mut s.outputs
+        } else {
+            &mut s.inputs
+        };
+        for &id in packed {
+            let e = &mut packed_elements[id];
+            e.comp = 5;
+            e.interp = 1;
+            e.cols = 1;
+            e.half = false;
+        }
         let insts = || p.blocks.iter().flat_map(|b| &b.insts);
         let writes_uavs = insts().any(|i| {
             matches!(i.fields, Fields::Image { .. } | Fields::Buffer { .. })
@@ -1465,6 +1504,7 @@ impl<'a> Lower<'a> {
         Lower {
             s,
             x,
+            packed_varyings: packed,
             bad,
             lane_fail: HashMap::new(),
             vals: HashMap::new(),
@@ -2357,8 +2397,16 @@ impl<'a> Lower<'a> {
         )
     }
 
+    fn logical_inputs(&self) -> &[SigElement] {
+        if self.packed_varyings.is_empty() {
+            &self.s.inputs
+        } else {
+            &self.x.inputs
+        }
+    }
+
     fn find_input(&self, row: u8, channel: u8) -> Option<(usize, u8)> {
-        self.s.inputs.iter().enumerate().find_map(|(id, e)| {
+        self.logical_inputs().iter().enumerate().find_map(|(id, e)| {
             let r = e.row?;
             // `then`, not `then_some`: the channel is only past `col` when
             // the condition holds.
@@ -9009,7 +9057,7 @@ impl<'a> Lower<'a> {
                 .find(|i| i.row == attribute.row && i.fp16)
                 .map(|i| {
                     let packs = if i.pack2 {
-                        input_packs(&self.x.native.io, &self.s.inputs)
+                        input_packs(&self.x.native.io, self.logical_inputs())
                     } else {
                         Vec::new()
                     };
@@ -9038,7 +9086,7 @@ impl<'a> Lower<'a> {
                 // per dword (`packed_half`); the host's are 32-bit floats.
                 let half = |l: &mut Self, h: u8| -> Result<Option<V>, Why> {
                     let src = if pack2 {
-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
+                        packed_half(l.logical_inputs(), &packs, attribute.row, h)
                     } else {
                         h.is_multiple_of(2).then_some((attribute.row, h / 2))
                     };
@@ -9090,7 +9138,10 @@ impl<'a> Lower<'a> {
     /// interpolation with computed barycentrics, or P10 or P20): then its
     /// element is declared constant and read with `attributeAtVertex`.
     fn per_vertex(&self, row: u8) -> bool {
-        self.x.io.interps.iter().any(|(_, i)| match *i {
+        self.packed_varyings
+            .iter()
+            .any(|&id| self.x.inputs[id].row == Some(u32::from(row)))
+            || self.x.io.interps.iter().any(|(_, i)| match *i {
             Interp::Weighted { attribute } => attribute.row == row,
             Interp::Vertex { attribute, vertex } => {
                 attribute.row == row && vertex != 2 && self.interpolated(row)
@@ -9115,27 +9166,36 @@ impl<'a> Lower<'a> {
         let (id, col) = self
             .find_input(row, ch)
             .ok_or("an input the signature lacks")?;
+        let half = self.packed_varyings.contains(&id).then_some(col != 0);
+        let col = if half.is_some() { 0 } else { col };
         let mode = match eval {
             Eval::Mode(mode) => mode,
             Eval::Weights { .. } => 1,
         };
         let e = &mut self.s.inputs[id];
+        if half.is_some() && mode != 1 {
+            return Err("a packed mesh varying read without explicit interpolation weights");
+        }
         if e.interp != mode && e.usage != 0 {
             return Err("one input interpolated two ways");
         }
         e.interp = mode;
         let Eval::Weights { p0, i, j } = eval else {
             return match self.load_any_input(id, col) {
+                Val::I32(x) if let Some(high) = half => {
+                    let f = self.unpack_f16(self.s.entry, x, high);
+                    Ok(self.as_int(f))
+                }
                 Val::I32(x) => Ok(x),
                 _ => Err("an input"),
             };
         };
-        let v0 = self.vertex_input(id, col, 0);
+        let v0 = self.vertex_input(id, col, 0, half);
         let c = self.cur;
         let mut acc = p0.then_some(v0);
         for (k, w) in [(1, i), (2, j)] {
             let Some(w) = w else { continue };
-            let vk = self.vertex_input(id, col, k);
+            let vk = self.vertex_input(id, col, k, half);
             let d = self.s.m.bin(c, Bin::Sub, vk, v0);
             acc = Some(match acc {
                 Some(a) => self.fmad(w, d, a),
@@ -9148,7 +9208,7 @@ impl<'a> Lower<'a> {
 
     /// Vertex `k` (0 the provoking vertex, as `barycentric` orders them)
     /// of a constant input element's channel, as a float.
-    fn vertex_input(&mut self, id: usize, col: u8, k: u8) -> V {
+    fn vertex_input(&mut self, id: usize, col: u8, k: u8, half: Option<bool>) -> V {
         let e = &mut self.s.inputs[id];
         e.usage |= 1 << col;
         let int = e.comp != 9;
@@ -9173,11 +9233,24 @@ impl<'a> Lower<'a> {
             137,
             &args,
         );
-        if int {
+        if let Some(high) = half {
+            self.unpack_f16(entry, v, high)
+        } else if int {
             self.s.m.cast(entry, Cast::Bitcast, v, self.s.t.f32)
         } else {
             v
         }
+    }
+
+    fn unpack_f16(&mut self, block: usize, value: V, high: bool) -> V {
+        let half = if high {
+            let k16 = self.s.m.i32(16);
+            self.s.m.bin(block, Bin::LShr, value, k16)
+        } else {
+            value
+        };
+        let ty = self.s.t.f32;
+        self.s.op(block, "legacyF16ToF32", Attr::ReadNone, ty, 131, &[half])
     }
 
     /// `x` (an f16 in the low bits) as the low half of VGPR `reg`: 16-bit
@@ -10508,6 +10581,8 @@ impl<'a> Lower<'a> {
         let primitive = matches!(e.target, Target::PrimitiveParam { .. });
         let outputs = if primitive {
             &self.s.prims
+        } else if mesh && !self.packed_varyings.is_empty() {
+            &self.x.outputs
         } else {
             &self.s.outputs
         };
@@ -10544,8 +10619,14 @@ impl<'a> Lower<'a> {
                         })
                     });
                     if let Some(id) = found {
-                        let col = src.expect("found").1 - outputs[id].col;
-                        stores.push((id, col, value, Some(high)));
+                        if mesh && self.packed_varyings.contains(&id) {
+                            if !high {
+                                stores.push((id, 0, value, None));
+                            }
+                        } else {
+                            let col = src.expect("found").1 - outputs[id].col;
+                            stores.push((id, col, value, Some(high)));
+                        }
                     }
                 }
             }
@@ -10660,15 +10741,7 @@ impl<'a> Lower<'a> {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
                 // An f16 half, declared a 32-bit float on the host.
-                let c = self.cur;
-                if high {
-                    let k16 = self.s.m.i32(16);
-                    x = self.s.m.bin(c, Bin::LShr, x, k16);
-                }
-                let f32t = self.s.t.f32;
-                let f = self
-                    .s
-                    .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                let f = self.unpack_f16(self.cur, x, high);
                 x = self.as_int(f);
             }
             let el = &mut elements(self, primitive)[id];
