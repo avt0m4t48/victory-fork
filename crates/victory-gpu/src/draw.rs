@@ -1805,6 +1805,10 @@ impl State {
             None => (span, per_frame),
         };
         let began = std::time::Instant::now();
+        // Bytes of textures uploaded in this pass so far: used to gate
+        // giant textures under a budget (one alone is allowed when nothing
+        // else has been done yet, to avoid starvation).
+        let mut done_bytes: u64 = 0;
         for (index, write) in due {
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 break;
@@ -1919,6 +1923,24 @@ impl State {
                     );
                 }
             }
+            // Under a budget (early or bake pass): recheck time before the
+            // heavy work of making and staging a texture, and cap each
+            // texture at 64 MiB so one giant upload cannot alone blow the
+            // watchdog. One giant texture is still allowed when nothing
+            // else has been done yet, to avoid starvation of textures that
+            // are always large.
+            const PER_TEXTURE_BUDGET: u64 = 64 << 20;
+            if PASS_BUDGET.get().is_some() {
+                if began.elapsed() > span {
+                    break;
+                }
+                if done_bytes > 0
+                    && SPENT.load(Ordering::Relaxed).saturating_add(PER_TEXTURE_BUDGET)
+                        > bytes_at_most
+                {
+                    break;
+                }
+            }
             let view = heap.handle(index).and_then(|handle| host.mirror(index, handle, true));
             let placed = view.as_ref().and_then(crate::descriptor::host::placed_texture);
             let resource = match placed.as_ref().or(view.as_ref()) {
@@ -1985,6 +2007,7 @@ impl State {
             };
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
+            done_bytes = done_bytes.saturating_add(bytes);
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
             match memory {
