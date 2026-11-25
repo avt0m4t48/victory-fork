@@ -49,6 +49,9 @@ pub(crate) fn counts() -> (u64, u64) {
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
+        // The view heap's null slot is one of the host settings below: make
+        // sure it is known before it is read.
+        crate::descriptor::host::probe_view_limit();
         let by_exe = std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe");
         tracing::info!(
             fingerprint = env!("VICTORY_TRANSLATOR_FINGERPRINT"),
@@ -77,6 +80,10 @@ fn build() -> &'static [u8; 32] {
         match exe {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
+                // So is the view heap's null slot (it differs by host GPU):
+                // a translation cached without the clamp must not be served.
+                crate::descriptor::host::probe_view_limit();
+                bytes.extend_from_slice(&victory_shader::emit::view_heap_limit().to_le_bytes());
                 // Which group barriers wait is part of the translation too.
                 bytes.push(victory_shader::emit::group_sync());
                 // So are the switches that pick the form of a wave64 program:
