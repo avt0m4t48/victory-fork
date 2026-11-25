@@ -1,0 +1,34 @@
+name: Loader 1012 Windows verification
+on:
+  push:
+    branches: [verify/loader-1012-ve1MQqXb]
+permissions:
+  contents: read
+jobs:
+  unwind:
+    name: ${{ matrix.case.name }}
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        case:
+          - name: Baseline
+            sha: ca8829ff551d2a8558daae74f8aa48d0b1ff7d70
+            test: crash::tests::unwinds_like_the_system_walk
+          - name: Candidate
+            sha: 42519bd93d47c034cda20e912d75577957ee7af5
+            test: crash::tests::unwinds_known_callers
+          - name: Negative control
+            sha: aea464776ad7e76790a430bc51111af706dff108
+            test: crash::tests::unwinds_known_callers
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.case.sha }}
+      - name: Verify checkout and toolchain
+        run: |
+          git rev-parse HEAD
+          rustup toolchain install
+          rustc -vV
+      - name: Run exact unwind test
+        run: cargo test -p victory-loader --locked --lib ${{ matrix.case.test }} -- --exact --nocapture
