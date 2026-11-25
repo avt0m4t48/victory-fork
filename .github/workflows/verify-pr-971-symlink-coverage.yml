@@ -1,0 +1,35 @@
+name: Independent Windows fixture for symlink scan PR 971
+on:
+  push:
+    branches: [verify/pr-971-symlink-coverage]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 14
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm no scanner source change beyond PR 971
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne 'b99f251855e906d24a936e0fe35d73bb82bf4aa1') { throw 'Unexpected PR source' }
+          git diff --exit-code HEAD~2 HEAD -- apps/victory/src
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check translate and warm-up before verifying shader-info scope
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          $output = & cargo test --locked -p victory --test shader_file_symlinks -- --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output | Out-String
+          if ($code -ne 101 -or $log -notmatch 'passed \["translate"\].*linked-game' -or $log -notmatch 'passed \["translate", "--warm", "all"\].*linked-game' -or $log -notmatch 'panicked at' -or $log -notmatch '\["shader-info"\].*shaders\.rpf' -or $log -notmatch 'containers found\s+0 \(in 0 files\)') {
+            throw "Expected translate and warm-up to pass and shader-info to skip the linked file, got code $code"
+          }
+          Write-Output 'Confirmed both translate modes and the separate shader-info gap'
+          exit 0
