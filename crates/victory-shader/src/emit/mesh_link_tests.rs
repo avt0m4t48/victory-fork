@@ -113,6 +113,11 @@ fn assert_pixel(actual: [f32; 4], expected: [f32; 4], label: &str, index: usize)
     );
 }
 
+fn half_spacing(value: f32) -> f32 {
+    let exponent = ((value.abs().to_bits() >> 23) & 0xff) as i32 - 127;
+    2.0_f32.powi(exponent.max(-14) - 10)
+}
+
 fn render_pair(
     host: &Host,
     root: &ID3D12RootSignature,
@@ -243,12 +248,28 @@ fn fork_emitted_mesh_pairs_match_unpacked_readback() {
         let packed = render_pair(&host, &root, "fork packed", &packed_ms, &packed_ps);
         let split = render_pair(&host, &root, "fork split", &split_ms, &split_ps);
         let mut covered = 0;
+        let mut rounded_differently = 0;
         for (index, (&actual, &expected)) in packed.iter().zip(&split).enumerate() {
-            assert_eq!(actual[3], expected[3], "{mode} coverage at {index}");
-            assert_pixel(actual, expected, mode, index);
+            assert_eq!(actual[2..], expected[2..], "{mode} coverage at {index}");
             if expected[3] == 1.0 {
                 covered += 1;
-                if mode == "flat" {
+            }
+            if mode == "center" && expected[3] == 1.0 {
+                for (sample, reference) in actual[..2].iter().zip(&expected[..2]) {
+                    // Hardware interpolation and explicit weights can round to
+                    // neighboring FP16 values. Check both finiteness and distance.
+                    let distance = (*sample - *reference).abs();
+                    assert!(
+                        sample.is_finite()
+                            && reference.is_finite()
+                            && distance <= half_spacing(sample.abs().min(reference.abs())),
+                        "{mode} pixel {index}: {actual:?} vs {expected:?}"
+                    );
+                    rounded_differently += usize::from(distance != 0.0);
+                }
+            } else {
+                assert_eq!(actual, expected, "{mode} pixel {index}");
+                if mode == "flat" && expected[3] == 1.0 {
                     assert_eq!(actual, [-2.0, 0.5, 0.0, 1.0]);
                 }
             }
@@ -260,6 +281,8 @@ fn fork_emitted_mesh_pairs_match_unpacked_readback() {
                 assert_pixel(packed[index], [a, b, 0.0, 1.0], mode, index);
             }
         }
-        eprintln!("Fork-emitted {mode}: read back {covered} matching pixels");
+        eprintln!(
+            "Fork-emitted {mode}: {covered} covered pixels, {rounded_differently} channels differ by one FP16 step"
+        );
     }
 }
