@@ -1,0 +1,24 @@
+name: Loader 1012 full Windows suite
+on:
+  push:
+    branches: [verify/loader-1012-coverage-Dj9IBrqU]
+permissions:
+  contents: read
+jobs:
+  loader:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        revision: [61c46dfac80ce1c8afc4071b4b33fbefd3ee30da]
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ matrix.revision }}
+      - name: Verify revision and toolchain
+        run: |
+          git rev-parse HEAD
+          rustup toolchain install
+          rustc -vV
+      - name: Run full loader suite
+        run: cargo test -p victory-loader --locked -- --test-threads=1
