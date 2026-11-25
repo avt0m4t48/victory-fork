@@ -114,6 +114,33 @@ What vx-layer adds on top of the fork's commit 4e17478:
   (`VICTORY_PLANE_NOW=0`: as before). Frame line: "times used before the pass"
   929 before, 0 after, in ten-minute runs without errors.
 
+- **Boats float: textures the title's CPU reads are copied back.** On the
+  console the CPU and the GPU share memory, so what a compute pass stores into
+  a texture is there for the CPU to read. The title's ocean wave passes write a
+  256x256 height map (R32_FLOAT) and a displacement map (R32G32_FLOAT), and its
+  CPU code samples them: that is what its boats float on. Here those textures
+  stayed on the card, the CPU read memory nothing had written, and boats sank
+  (the first boat mission failed every time). Textures of the kinds in
+  `VICTORY_TEXTURE_BACK` (by default `256x256f41,256x256f16,64x64f16,128x128f36`,
+  the kinds the title was seen reading; `0`: none) are copied into a read-back
+  buffer when a list whose shaders write one closes, and tiled into the
+  texture's title memory in the console's layout once it has run. Twelve-minute
+  run on the water: the boat floats, the mission goes on, no errors.
+- **`VICTORY_READ_WATCH=1`** (diagnostics builds): finds such reads. The title
+  memory of textures shaders write is guarded, and every place in the title's
+  own code that reads one is logged with the texture's size and format (`=2`:
+  render targets too). That is how the ocean maps were found.
+- **Pipelines the host refused or drew wrong:** blending into an integer render
+  target (which the console ignores and the host refuses) is turned off for that
+  target; a draw whose bound render targets are in other formats than its
+  pipeline names gets that pipeline made again for the bound formats
+  (`VICTORY_TARGET_VARIANTS=0`: off). Both were found with the D3D12 debug layer.
+- Merged: fxceless/victory-fork 310c6eb (textures packed beside each other no
+  longer push each other out of the upload queue) and, from
+  [VItoriaBr](https://github.com/uiliannn/VItoriaBr), the copy-back relay race fix,
+  descriptor-mirror locking, the dynamic-descriptor wraparound scan and the
+  texture-staging budget check.
+
 Measured on an RTX 4090 with all of the above: about 318 ms per frame at
 4,000-7,000 draws (3.1 fps), seven-minute runs without errors.
 
