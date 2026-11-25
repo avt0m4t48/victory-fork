@@ -5707,23 +5707,34 @@ impl Host {
             let mut progress = Vec::new();
             let mut node = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = node.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                let done = p.pLastBreadcrumbValue.as_ref();
                 let ours = p.pCommandList.as_ref().map(|l| l.as_raw());
                 let index = runs.iter().position(|r| Some(r.list.as_raw()) == ours);
+                let done = done.map_or_else(|| "unknown".to_owned(), u32::to_string);
                 progress.push(format!("{done}/{} {index:?}", p.BreadcrumbCount));
                 node = p.pNext;
             }
             text.push_str(&format!("; breadcrumbs (done/count, list) {progress:?}"));
             let mut plain = crumbs.pHeadAutoBreadcrumbNode;
             while let Some(p) = plain.as_ref() {
-                let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
-                if done < p.BreadcrumbCount && !p.pCommandHistory.is_null() {
+                let done = p.pLastBreadcrumbValue.as_ref();
+                if let Some(&done) = done
+                    && done < p.BreadcrumbCount
+                    && !p.pCommandHistory.is_null()
+                {
                     let history =
                         std::slice::from_raw_parts(p.pCommandHistory, p.BreadcrumbCount as usize);
-                    text.push_str(&format!(
-                        "; a list stopped at command {done} of {} (op {})",
-                        p.BreadcrumbCount, history[done as usize].0
-                    ));
+                    if done == 0 {
+                        text.push_str(&format!(
+                            "; a list has no completed breadcrumbs ({} recorded, first op {})",
+                            p.BreadcrumbCount, history[0].0
+                        ));
+                    } else {
+                        text.push_str(&format!(
+                            "; a list stopped at command {done} of {} (op {})",
+                            p.BreadcrumbCount, history[done as usize].0
+                        ));
+                    }
                     let list = p.pCommandList.as_ref().map(|l| l.as_raw());
                     let run = runs.iter().find(|r| Some(r.list.as_raw()) == list);
                     // The k-th marker command is the k-th note.
