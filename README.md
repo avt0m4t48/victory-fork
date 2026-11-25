@@ -141,6 +141,17 @@ What vx-layer adds on top of the fork's commit 4e17478:
   descriptor-mirror locking, the dynamic-descriptor wraparound scan and the
   texture-staging budget check.
 
+- **Merged [victory-world-runtime](https://github.com/ZSlayerHQ/victory-world-runtime)
+  (branch `next`)**: [myokex's victory-amd](https://github.com/myokex/victory-amd)
+  line (the guard over all the views of a page, which brings room walls back;
+  texture spans by true memory and partial-mip detiling; dispatches over 65,535
+  groups in two parts; `victory warm`, which translates every shader ahead of
+  a run) with Joshua Odom's fix for kernel reads into title memory, and the
+  culling of mesh primitives that index past the vertices written (stray
+  stretched triangles). On the water: characters drawn whole, no stray
+  triangles, boats float; twelve minutes without errors. Run
+  `victory.exe warm` once after building (the shader cache key changed).
+
 Measured on an RTX 4090 with all of the above: about 318 ms per frame at
 4,000-7,000 draws (3.1 fps), seven-minute runs without errors.
 
