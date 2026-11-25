@@ -20,12 +20,18 @@ pub fn run(
     victory_hle::modules::lifecycle::wait_for_previous();
     let cfg = victory_core::Config::load()?;
     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
-    let prepared = victory_loader::prepare(&original)?;
+    let mut prepared = victory_loader::prepare(&original)?;
     let hash = prepared.original_hash.to_hex();
-    match victory_game::identify(&hash) {
+    let build = victory_game::identify(&hash);
+    match build {
         Some(build) => println!("build          {} ({hash})", build.label),
         None => println!("build          unknown ({hash})"),
     }
+    let known = known_patches_on(
+        console,
+        std::env::var("VICTORY_TITLE_PATCHES").ok().as_deref(),
+    );
+    apply_title_patches(&mut prepared, build.filter(|_| known))?;
 
     let images = cfg.cache_subdir("images")?;
     victory_hle::modules::d3d12x::use_shader_cache(cfg.cache_subdir("shaders")?);
@@ -315,9 +321,100 @@ impl LoaderLock {
     }
 }
 
+/// Whether the known build's code patches apply, given
+/// `VICTORY_TITLE_PATCHES` (`var`): `0` none, `1` on any console; unset (or
+/// anything else), only with `--console series-s`. On a Series X the
+/// upscaler choice they change already returns what they write, and its
+/// image stays the plain copy it always was.
+#[cfg(windows)]
+fn known_patches_on(console: Console, var: Option<&str>) -> bool {
+    match var {
+        Some("0") => false,
+        Some("1") => true,
+        _ => matches!(console, Console::SeriesS),
+    }
+}
+
+/// Bytes as lower-case hex.
+#[cfg(windows)]
+fn hex_str(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The known build's code patches (`build`: `None` for none), then any from
+/// `VICTORY_TITLE_PATCH=<rva>:<old hex>:<new hex>,...`. The old bytes must
+/// be there (another build of the title is refused), and the patched copy
+/// has a file name of its own. (victory-fork #798, by KyleS98.)
+#[cfg(windows)]
+fn apply_title_patches(
+    prepared: &mut victory_loader::PreparedImage,
+    build: Option<&victory_game::KnownBuild>,
+) -> Result<()> {
+    let mut patches = Vec::new();
+    let mut names = Vec::new();
+    for p in build.map_or(&[][..], |b| b.patches) {
+        patches.push((p.rva, p.expect.to_vec(), p.write.to_vec()));
+        names.push(p.name.to_owned());
+    }
+    let spec = std::env::var("VICTORY_TITLE_PATCH").unwrap_or_default();
+    for one in spec.split(',').filter(|p| !p.trim().is_empty()) {
+        let parts: Vec<&str> = one.split(':').collect();
+        anyhow::ensure!(
+            parts.len() == 3,
+            "VICTORY_TITLE_PATCH entry is not <rva>:<old>:<new>: {one}"
+        );
+        let rva = u32::from_str_radix(parts[0].trim().trim_start_matches("0x"), 16)?;
+        patches.push((rva, from_hex(parts[1])?, from_hex(parts[2])?));
+        names.push("VICTORY_TITLE_PATCH".to_owned());
+    }
+    if patches.is_empty() {
+        return Ok(());
+    }
+    prepared.patch(&patches)?;
+    for ((rva, old, new), name) in patches.iter().zip(names) {
+        println!(
+            "title patch    +{rva:#x} {name}: {} -> {}",
+            hex_str(old),
+            hex_str(new)
+        );
+    }
+    Ok(())
+}
+
+/// Bytes from hex digits.
+#[cfg(windows)]
+fn from_hex(s: &str) -> Result<Vec<u8>> {
+    let s = s.trim();
+    anyhow::ensure!(s.len().is_multiple_of(2), "odd hex length: {s}");
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).map_err(anyhow::Error::from))
+        .collect()
+}
+
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    /// The known build's patches: on with `--console series-s`, off on a
+    /// Series X unless asked for, and off everywhere with `0`.
+    #[test]
+    fn title_patches_follow_the_console_and_the_switch() {
+        use super::{Console, known_patches_on};
+        assert!(known_patches_on(Console::SeriesS, None));
+        assert!(!known_patches_on(Console::SeriesX, None));
+        assert!(!known_patches_on(Console::SeriesS, Some("0")));
+        assert!(known_patches_on(Console::SeriesX, Some("1")));
+        assert!(known_patches_on(Console::SeriesS, Some("")));
+        assert!(!known_patches_on(Console::SeriesX, Some("")));
+    }
+
+    #[test]
+    fn hex_reads_back_as_written() {
+        assert_eq!(super::from_hex(" b80600 ").unwrap(), [0xb8, 0x06, 0x00]);
+        assert_eq!(super::hex_str(&[0x48, 0x83, 0xec]), "4883ec");
+        assert!(super::from_hex("abc").is_err());
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {

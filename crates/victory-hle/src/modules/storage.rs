@@ -45,7 +45,7 @@ type This = *const Object;
 /// The path titles get: the root of a virtual drive over the folder. On the
 /// console storage is a drive of its own, and titles rely on it: Minecraft
 /// keeps only what precedes the path's last `:\` and mounts that as a
-/// drive, so a host folder such as `C:\Users\..` would make it write to the
+/// drive, so a host folder such as `C:\some\folder` would make it write to the
 /// root of `C:`. None (the path calls fail) before the title is set.
 fn folder() -> Option<String> {
     let storage = runtime::title().storage;

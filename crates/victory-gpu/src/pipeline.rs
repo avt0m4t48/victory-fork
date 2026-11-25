@@ -515,6 +515,14 @@ pub(crate) fn making() -> u64 {
     make::waiting()
 }
 
+/// Host pipelines created by the driver and loaded from the library, since
+/// the start (the live profiler).
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn made_and_loaded() -> [u64; 2] {
+    use std::sync::atomic::Ordering::Relaxed;
+    [library::MADE.load(Relaxed), library::LOADED.load(Relaxed)]
+}
+
 /// Draws and dispatches dropped since the last [`take_drops`], by reason
 /// (diagnostics).
 #[cfg(all(windows, feature = "diagnostics"))]

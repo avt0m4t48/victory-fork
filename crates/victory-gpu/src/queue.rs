@@ -53,6 +53,11 @@ enum Held {
     Run(Vec<crate::list::Detached>, Vec<usize>),
     /// A signal of the queue's, due after what it holds before it.
     Signal(usize, u64),
+    /// With [`behind`]: the submission at the head of the line is being
+    /// prepared and sent by our thread, with the line unlocked, so the
+    /// title can add to its end meanwhile; whatever is added stays behind
+    /// this (the line is not empty), signals too.
+    Running,
 }
 
 /// The queues that hold something (their addresses).
@@ -131,7 +136,7 @@ fn submit_cut(this: This, lists: &[This]) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let first = if lock(&queue(this).held).is_empty() {
+    let first = if !behind() && lock(&queue(this).held).is_empty() {
         lists
             .iter()
             .position(|&l| crate::list::cut_list(l))
@@ -307,22 +312,121 @@ fn hold(this: This, what: impl FnOnce() -> Held) -> bool {
 /// one.
 #[cfg(windows)]
 pub(crate) fn release_held(all: bool) {
+    if !all && behind() {
+        // A thread of ours runs what is free to run ([`behind`]).
+        wake();
+        return;
+    }
+    release_held_now(all);
+}
+
+/// Whether a submission is only put in its queue's line by the thread
+/// that submits it, and prepared and sent by a thread of ours
+/// (`VICTORY_ASYNC_SUBMIT=1`; needs flights and lists cut at their waits,
+/// both defaults).
+///
+/// Why: the profile of run 213 (292 ms a frame) has the title's render
+/// thread inside `queue::execute` for 202 ms of every frame: 155 ms in
+/// `Host::submit` (preparing: the copies of title memory, the write
+/// watch, descriptors, textures; and waiting for flights), while its five
+/// recording threads stand idle 78 % of the time and the card 43 %. The
+/// title's thread does nothing with the result of that work: it only has
+/// to be done before the lists run, in order.
+///
+/// With the switch a submission's lists are taken from the title's lists
+/// (as they already are when the queue holds anything) and put behind
+/// the queue's line; one thread of ours ([`worker`]) runs the line in
+/// order. A signal of the queue goes behind them, as it does behind
+/// anything held. Everything that must see earlier submissions done runs
+/// the line itself first: a present, and every submission of ours that
+/// is waited for ([`before_sync`]).
+///
+/// What it assumes: title memory a submission reads is not rewritten by
+/// the title between its submit call and the moment our thread prepares
+/// it, some milliseconds later. On the console the card reads that
+/// memory when it runs the list, later still, so a title that rewrote it
+/// earlier would be wrong there too.
+#[cfg(windows)]
+pub(crate) fn behind() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_ASYNC_SUBMIT").is_some_and(|v| v == "1") && crate::host::late() && cuts();
+        if on {
+            tracing::info!("submissions are prepared and sent by a thread of ours, not by the thread that submits (VICTORY_ASYNC_SUBMIT=1)");
+            let _ = std::thread::Builder::new().name("victory-submit".into()).spawn(worker);
+        }
+        on
+    })
+}
+
+/// Whether there is something for [`worker`] to look at.
+#[cfg(windows)]
+static WORK: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+#[cfg(windows)]
+fn wake() {
+    *lock(&WORK.0) = true;
+    WORK.1.notify_one();
+}
+
+/// The thread of [`behind`]: runs what queues hold as far as it is free
+/// to run, each time something was added or a fence moved.
+#[cfg(windows)]
+fn worker() {
+    loop {
+        {
+            let mut work = lock(&WORK.0);
+            while !*work {
+                work = WORK.1.wait(work).unwrap_or_else(|e| e.into_inner());
+            }
+            *work = false;
+        }
+        release_held_now(false);
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// This thread is inside [`release_held_now`].
+    static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Before a submission of ours that is waited for, with [`behind`]: what
+/// the queues hold and is free to run runs first, on this thread, so the
+/// submission keeps its place behind them.
+#[cfg(windows)]
+pub(crate) fn before_sync() {
+    if behind() && !RELEASING_HERE.get() {
+        release_held_now(false);
+    }
+}
+
+#[cfg(windows)]
+fn release_held_now(all: bool) {
     // One caller at a time, so a queue's submissions keep their order.
     static RELEASING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     if lock(&WAITING).is_empty() {
         return;
     }
     let _one = lock(&RELEASING);
+    let was_here = RELEASING_HERE.replace(true);
+    struct Leave(bool);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            RELEASING_HERE.set(self.0);
+        }
+    }
+    let _leave = Leave(was_here);
     loop {
         let queues = lock(&WAITING).clone();
         let mut moved = false;
         for q in queues {
             // SAFETY: a live queue: one released is taken off the list.
-            let held = unsafe { &(*(q as *const Queue)).held };
-            let mut held = lock(held);
+            let line = unsafe { &(*(q as *const Queue)).held };
+            let mut held = lock(line);
             loop {
                 match held.first() {
-                    None => break,
+                    None | Some(Held::Running) => break,
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
@@ -332,7 +436,11 @@ pub(crate) fn release_held(all: bool) {
                     Some(_) => {}
                 }
                 match held.remove(0) {
+                    #[cfg(feature = "diagnostics")]
+                    Held::Wait(fence, value) => crate::live::held_released(q, fence, value),
+                    #[cfg(not(feature = "diagnostics"))]
                     Held::Wait(..) => {}
+                    Held::Running => {}
                     Held::Value(wait) => {
                         // Passed at a present without being met: what the
                         // queue stood at.
@@ -374,7 +482,20 @@ pub(crate) fn release_held(all: bool) {
                         {
                             // Not waited for: the host keeps the lists
                             // until they are settled.
-                            host.execute_late(lists, order);
+                            if behind() && !all {
+                                // The line is open while this part is
+                                // prepared and sent: only this thread takes
+                                // from its head (one releaser at a time).
+                                held.insert(0, Held::Running);
+                                drop(held);
+                                host.execute_late(lists, order);
+                                held = lock(line);
+                                if matches!(held.first(), Some(Held::Running)) {
+                                    held.remove(0);
+                                }
+                            } else {
+                                host.execute_late(lists, order);
+                            }
                         } else {
                             let ran = {
                                 let runs: Vec<&crate::host::HostList> =
@@ -585,12 +706,229 @@ extern "system" fn execute(this: This, count: u32, lists: *const This) {
     }
 }
 
-/// The start of a present plane: frame token, then the plane's resources.
+/// A present plane's description (`D3D12XBOX_PRESENT_PLANE_PARAMETERS`),
+/// [`PLANE_STRIDE`] bytes, in the field order of the public GDK binding:
+/// frame token, the plane's resources, their source rectangles, the
+/// destination placement, colour space, scale filter, extended
+/// descriptions and flags. The title presents an array of them; the first
+/// three fields were all that was read before planes were composed, and
+/// the stride of 24 bytes that implied was wrong (ZSlayerHQ's runtime #10,
+/// by Cleverdee, found 72 against the second plane's token).
 #[repr(C)]
 pub(crate) struct Plane {
     token: u64,
     count: u32,
     resources: *const This,
+    /// `D3D12_RECT`s (`[left, top, right, bottom]`), one per resource, or
+    /// null.
+    src_rects: *const [i32; 4],
+    /// Where the plane goes in the output, or null. Not read: each plane
+    /// fills the window ([`crate::compose`]).
+    dest: *const u8,
+    color_space: u32,
+    scale_filter: u32,
+    extended_count: u32,
+    /// The extended descriptions themselves: not read.
+    _extended: *const u8,
+    flags: u32,
+}
+
+/// Bytes from one plane's description to the next.
+const PLANE_STRIDE: usize = 72;
+const _: () = assert!(std::mem::size_of::<Plane>() == PLANE_STRIDE);
+const _: () = assert!(std::mem::offset_of!(Plane, count) == 8);
+const _: () = assert!(std::mem::offset_of!(Plane, resources) == 16);
+const _: () = assert!(std::mem::offset_of!(Plane, src_rects) == 24);
+const _: () = assert!(std::mem::offset_of!(Plane, dest) == 32);
+const _: () = assert!(std::mem::offset_of!(Plane, color_space) == 40);
+const _: () = assert!(std::mem::offset_of!(Plane, _extended) == 56);
+const _: () = assert!(std::mem::offset_of!(Plane, flags) == 64);
+
+/// Planes composed at most (the first four).
+#[cfg(windows)]
+const MAX_PLANES: usize = 4;
+
+/// A present's plane as the title describes it: its first resource and
+/// what the composition reads or logs of it.
+#[cfg(windows)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Described {
+    resource: This,
+    /// Whether its token is the first plane's (a check of the stride).
+    same_token: bool,
+    src: Option<[i32; 4]>,
+    placed: bool,
+    color_space: u32,
+    scale_filter: u32,
+    extended: u32,
+    flags: u32,
+}
+
+/// The first [`MAX_PLANES`] planes of a present that name a resource, each
+/// resource once (a repeat is not drawn over itself).
+///
+/// # Safety
+/// `parameters` is null or points at `planes` plane descriptions, each
+/// listing `count` resources at `resources` and, when `src_rects` is set,
+/// as many rectangles there.
+#[cfg(windows)]
+unsafe fn described(planes: u32, parameters: *const Plane) -> Vec<Described> {
+    let mut found: Vec<Described> = Vec::new();
+    if parameters.is_null() {
+        return found;
+    }
+    // SAFETY: the caller's: at least one description.
+    let token = unsafe { (*parameters).token };
+    for i in 0..(planes as usize).min(MAX_PLANES) {
+        // SAFETY: the caller's: description `i` of `planes`.
+        let plane = unsafe { &*parameters.add(i) };
+        if plane.count == 0 || plane.resources.is_null() {
+            continue;
+        }
+        // SAFETY: the caller's: the plane lists `count` resources.
+        let resource = unsafe { plane.resources.read_unaligned() };
+        if resource.is_null() || found.iter().any(|d| d.resource == resource) {
+            continue;
+        }
+        // SAFETY: the caller's: a rectangle per resource when set.
+        let src = (!plane.src_rects.is_null()).then(|| unsafe { plane.src_rects.read_unaligned() });
+        found.push(Described {
+            resource,
+            same_token: plane.token == token,
+            src,
+            placed: !plane.dest.is_null(),
+            color_space: plane.color_space,
+            scale_filter: plane.scale_filter,
+            extended: plane.extended_count,
+            flags: plane.flags,
+        });
+    }
+    found
+}
+
+/// `VICTORY_PRESENT_PLANES` (`var`): `None` when presents show their first
+/// plane alone (`0`); else whether planes are composed on every console
+/// (any value: unset, with `--console series-s` only, so a Series X run is
+/// as it was) and the blending forced on every plane after the first
+/// (`premul`, `straight`; else by each plane's flags).
+#[cfg(windows)]
+fn compose_switch(var: Option<&str>) -> Option<(bool, Option<crate::compose::Alpha>)> {
+    use crate::compose::Alpha;
+    match var {
+        Some("0") => None,
+        None => Some((false, None)),
+        Some("premul") => Some((true, Some(Alpha::Premultiplied))),
+        Some("straight") => Some((true, Some(Alpha::Straight))),
+        Some(_) => Some((true, None)),
+    }
+}
+
+/// [`compose_switch`] as this run has it, and whether presents of several
+/// planes are composed now.
+#[cfg(windows)]
+fn compose_planes() -> Option<Option<crate::compose::Alpha>> {
+    static SWITCH: std::sync::OnceLock<Option<(bool, Option<crate::compose::Alpha>)>> =
+        std::sync::OnceLock::new();
+    let var = || std::env::var("VICTORY_PRESENT_PLANES").ok();
+    let (everywhere, alpha) = (*SWITCH.get_or_init(|| compose_switch(var().as_deref())))?;
+    (everywhere || crate::console::current() == crate::console::Console::SeriesS).then_some(alpha)
+}
+
+/// Shows a present of several planes composed ([`crate::compose`]); false
+/// if it is not one (fewer than two planes with a host texture, or a plane
+/// the composition cannot read), for the plain copy of the first plane.
+///
+/// # Safety
+/// As [`described`].
+#[cfg(windows)]
+unsafe fn present_composed(
+    host: &crate::host::Host,
+    planes: u32,
+    parameters: *const Plane,
+    alpha: Option<crate::compose::Alpha>,
+    frame: u64,
+) -> bool {
+    use crate::compose::{Alpha, ShownPlane, composable};
+    // SAFETY: the caller's.
+    let found = unsafe { described(planes, parameters) };
+    if found.len() < 2 {
+        return false;
+    }
+    let textures: Vec<_> = found
+        .iter()
+        .filter_map(|d| Some((d, crate::resource::host_resource(d.resource)?)))
+        .collect();
+    log_planes(planes, &textures);
+    if textures.len() < 2 {
+        return false;
+    }
+    if !textures.iter().all(|(_, t)| composable(t)) {
+        static TOLD: AtomicBool = AtomicBool::new(false);
+        if !TOLD.swap(true, Ordering::Relaxed) {
+            tracing::warn!("present planes the composition cannot read: the first is shown alone");
+        }
+        return false;
+    }
+    // Each plane goes to the pixel-shader-readable state for the
+    // composition and back ([`crate::host::Host::present_planes`]).
+    const READABLE: u32 = 0x80;
+    let shown: Vec<ShownPlane<'_>> = textures
+        .iter()
+        .map(|(d, texture)| ShownPlane {
+            texture,
+            state: crate::resource::host_transition(d.resource, READABLE)
+                .map_or(READABLE, |(_, before)| before),
+            src: d.src,
+            alpha: Alpha::of(d.flags, alpha),
+        })
+        .collect();
+    let shown_now = host.present_planes(&shown, frame);
+    for ((d, _), plane) in textures.iter().zip(&shown) {
+        crate::resource::host_transition(d.resource, plane.state);
+    }
+    #[cfg(feature = "diagnostics")]
+    blinks(frame, textures[0].0.resource, shown[0].state, shown_now);
+    #[cfg(not(feature = "diagnostics"))]
+    let _ = shown_now;
+    true
+}
+
+/// Logs a present's planes whenever what they are changes: how many the
+/// title gave, then for each one shown its size, format, source rectangle,
+/// flags, colour space, scale filter, whether it is placed and has
+/// extended descriptions, and whether its token is the first plane's.
+#[cfg(windows)]
+fn log_planes(
+    planes: u32,
+    textures: &[(
+        &Described,
+        &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    )],
+) {
+    static LAST: std::sync::Mutex<String> = std::sync::Mutex::new(String::new());
+    let mut text = format!("{planes} planes, stride {PLANE_STRIDE}:");
+    for (d, texture) in textures {
+        // SAFETY: a live resource.
+        let desc = unsafe { texture.GetDesc() };
+        text += &format!(
+            " [{}x{} format {} src {:?} flags {:#x} colour space {} filter {} placed {} extended {} same token {}]",
+            desc.Width,
+            desc.Height,
+            desc.Format.0,
+            d.src,
+            d.flags,
+            d.color_space,
+            d.scale_filter,
+            d.placed,
+            d.extended,
+            d.same_token
+        );
+    }
+    let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if *last != text {
+        tracing::info!(planes = %text, "present planes changed");
+        *last = text;
+    }
 }
 /// Submission tagged with the frame it belongs to `(count, lists, frame
 /// token, flags)`; frames are paced elsewhere, so it runs as a plain one.
@@ -656,6 +994,8 @@ extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
             let behind = !held.is_empty() || now < value;
             if behind && waits() {
                 held.push(Held::Wait(fence as usize, value));
+                #[cfg(feature = "diagnostics")]
+                crate::live::held_wait(this as usize, fence as usize, value);
             }
             behind
         };
@@ -750,7 +1090,9 @@ pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
 
-/// Shows the first plane's first resource in our window.
+/// Shows the first plane's first resource in our window, or, with several
+/// planes where [`compose_planes`] says so, the planes composed
+/// ([`present_composed`]).
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
@@ -762,17 +1104,26 @@ extern "system" fn present(
 ) -> HRESULT {
     #[cfg(all(windows, feature = "diagnostics"))]
     crate::copystat::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::live::present_begins();
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::profile::frame();
     // Submissions sent to the card and not waited for are settled first,
     // and what that frees runs in its own order, before anything is forced.
     #[cfg(windows)]
     if crate::host::late() && !crate::host::late_free_present() {
+        // (With `behind`: what the queues hold runs here first, and what
+        // it sent is settled with the rest.)
+        if behind() {
+            release_held_now(false);
+        }
         crate::host::settle_for_present();
-        release_held(false);
+        release_held_now(false);
         crate::host::settle_for_present();
     } else if crate::host::late() {
         // The present is sent ahead too: what waits for a value a flight
         // will write runs behind that flight, and nothing is settled here.
-        release_held(false);
+        release_held_now(false);
     }
     // shortcut: what a queue still holds at a present runs now, whatever
     // its fence: a wait is not kept across frames.
@@ -813,6 +1164,18 @@ extern "system" fn present(
         if crate::capture::listed(frame) {
             crate::capture::dump_targets(frame);
         }
+    }
+    // Several planes (Series S: the game image under the interface) are
+    // composed, where `VICTORY_PRESENT_PLANES` and the console say so; one
+    // plane, and planes that cannot be composed, take the plain copy below.
+    #[cfg(windows)]
+    if planes > 1
+        && let Some(alpha) = compose_planes()
+        && let Some(host) = crate::host::host()
+        // SAFETY: the title passes `planes` plane descriptions.
+        && unsafe { present_composed(host, planes, plane_parameters, alpha, frame) }
+    {
+        return S_OK;
     }
     #[cfg(windows)]
     if planes > 0
@@ -1016,6 +1379,113 @@ const fn queue_table(newer: bool) -> [*const (); 36] {
 
 static FUNCTIONS: Table<36> = Table(queue_table(false));
 static NEWER_FUNCTIONS: Table<36> = Table(queue_table(true));
+
+#[cfg(all(test, windows))]
+mod plane_tests {
+    use super::*;
+    use crate::compose::Alpha;
+
+    /// Plane descriptions as the title lays them out, [`PLANE_STRIDE`]
+    /// bytes apart: plane `i` has token `tokens[i]` and names `lists[i]`
+    /// (count, list); plane 1 has a source rectangle and flags 0x2.
+    fn laid_out(tokens: [u64; 3], lists: [(u32, *const This); 3], rect: &[i32; 4]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 3 * PLANE_STRIDE];
+        for (i, (token, (count, list))) in tokens.into_iter().zip(lists).enumerate() {
+            let at = i * PLANE_STRIDE;
+            bytes[at..at + 8].copy_from_slice(&token.to_le_bytes());
+            bytes[at + 8..at + 12].copy_from_slice(&count.to_le_bytes());
+            bytes[at + 16..at + 24].copy_from_slice(&(list as u64).to_le_bytes());
+        }
+        let second = PLANE_STRIDE;
+        bytes[second + 24..second + 32].copy_from_slice(&(rect.as_ptr() as u64).to_le_bytes());
+        bytes[second + 40..second + 44].copy_from_slice(&7u32.to_le_bytes());
+        bytes[second + 64..second + 68].copy_from_slice(&2u32.to_le_bytes());
+        bytes
+    }
+
+    /// The second plane is read 72 bytes after the first, with its source
+    /// rectangle, colour space and flags; a plane without resources, a
+    /// null resource and a repeat are left out, and nothing past the
+    /// planes given is read.
+    #[test]
+    fn planes_are_read_72_bytes_apart() {
+        let (a, b, c) = (0x1000 as This, 0x2000 as This, 0x3000 as This);
+        let (first, second, third, repeat, null) = ([a], [b], [c], [a], [std::ptr::null()]);
+        let rect = [0, 0, 1920, 1080];
+        let bytes = laid_out(
+            [9, 9, 9],
+            [
+                (1, first.as_ptr()),
+                (1, second.as_ptr()),
+                (1, third.as_ptr()),
+            ],
+            &rect,
+        );
+        // The descriptions are read as `Plane`s: 8-byte aligned.
+        let words: Vec<u64> = bytes
+            .chunks(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+            .collect();
+        let at = words.as_ptr().cast::<Plane>();
+        // SAFETY: `planes` descriptions laid out as the title's, their
+        // lists and rectangle live locals.
+        let read = |planes| unsafe { described(planes, at) };
+        let two = read(2);
+        assert_eq!(two.len(), 2);
+        assert_eq!((two[0].resource, two[1].resource), (a, b));
+        assert_eq!((two[0].src, two[1].src), (None, Some(rect)));
+        assert_eq!((two[0].flags, two[1].flags), (0, 2));
+        assert_eq!(two[1].color_space, 7);
+        assert!(two[1].same_token && !two[1].placed);
+        assert_eq!(Alpha::of(two[1].flags, None), Alpha::Straight);
+        assert_eq!(read(3).len(), 3);
+        assert_eq!(read(1).len(), 1);
+        // SAFETY: as above, and a null array.
+        assert!(unsafe { described(2, std::ptr::null()) }.is_empty());
+
+        // A repeat of the first plane's resource, then a null one and an
+        // empty list: only the first plane is left.
+        for lists in [
+            [
+                (1, first.as_ptr()),
+                (1, repeat.as_ptr()),
+                (1, null.as_ptr()),
+            ],
+            [
+                (1, first.as_ptr()),
+                (0, second.as_ptr()),
+                (1, std::ptr::null()),
+            ],
+        ] {
+            let bytes = laid_out([9, 8, 9], lists, &rect);
+            let words: Vec<u64> = bytes
+                .chunks(8)
+                .map(|w| u64::from_le_bytes(w.try_into().unwrap()))
+                .collect();
+            // SAFETY: as above.
+            let found = unsafe { described(3, words.as_ptr().cast()) };
+            assert_eq!(found.len(), 1, "{found:?}");
+        }
+    }
+
+    /// Composed with `--console series-s` unless told otherwise; `0` never;
+    /// any other value on every console, `premul` and `straight` forcing
+    /// the blending.
+    #[test]
+    fn the_switch_names_where_planes_are_composed_and_how() {
+        assert_eq!(compose_switch(None), Some((false, None)));
+        assert_eq!(compose_switch(Some("0")), None);
+        assert_eq!(compose_switch(Some("1")), Some((true, None)));
+        assert_eq!(
+            compose_switch(Some("premul")),
+            Some((true, Some(Alpha::Premultiplied)))
+        );
+        assert_eq!(
+            compose_switch(Some("straight")),
+            Some((true, Some(Alpha::Straight)))
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

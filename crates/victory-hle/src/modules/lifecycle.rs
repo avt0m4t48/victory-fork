@@ -116,6 +116,18 @@ pub extern "system" fn CreateWindowExA(
 /// its proportions, and centred; what it shows is scaled to it (the swap
 /// chain stretches).
 fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    // A monitor named by `VICTORY_MONITOR`: the window goes there, fitted
+    // and centred, whatever the title asked for.
+    if parent.is_null()
+        && let Some(area) = chosen_work_area()
+    {
+        let (w, h) = fit_into(&area, width, height);
+        let (w, h) = if w > 0 && h > 0 { (w, h) } else { (area.right - area.left, area.bottom - area.top) };
+        let left = area.left + (area.right - area.left - w) / 2;
+        let top = area.top + (area.bottom - area.top - h) / 2;
+        tracing::info!(width, height, to = ?(left, top, w, h), "title window put on the monitor VICTORY_MONITOR names");
+        return (left, top, w, h);
+    }
     let mut area = RECT::default();
     // SAFETY: `area` receives the primary monitor's work area.
     let known =
@@ -129,6 +141,46 @@ fn fit(parent: HWND, x: i32, y: i32, width: i32, height: i32) -> (i32, i32, i32,
     let left = area.left + (area.right - area.left - w) / 2;
     let top = area.top + (area.bottom - area.top - h) / 2;
     (left, top, w, h)
+}
+
+/// The work area of the monitor `VICTORY_MONITOR` names: its device name
+/// (`DISPLAY3` or `\\.\DISPLAY3`), or its 1-based place in the order
+/// Windows lists the monitors. Unset or not found: none (the primary
+/// monitor's work area, as before).
+fn chosen_work_area() -> Option<RECT> {
+    use windows_sys::Win32::Graphics::Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW};
+    let want = std::env::var("VICTORY_MONITOR").ok()?;
+    let want = want.trim().trim_start_matches(r"\\.\").to_ascii_uppercase();
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, data: LPARAM) -> windows_sys::core::BOOL {
+        // SAFETY: `data` is the list below, alive for the enumeration.
+        let list = unsafe { &mut *(data as *mut Vec<(String, RECT)>) };
+        let mut info = MONITORINFOEXW::default();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        // SAFETY: a monitor handle from the enumeration and a sized struct.
+        if unsafe { GetMonitorInfoW(monitor, (&raw mut info).cast::<MONITORINFO>()) } != 0 {
+            let end = info.szDevice.iter().position(|&c| c == 0).unwrap_or(info.szDevice.len());
+            list.push((String::from_utf16_lossy(&info.szDevice[..end]), info.monitorInfo.rcWork));
+        }
+        1
+    }
+    let mut list: Vec<(String, RECT)> = Vec::new();
+    // SAFETY: the callback only touches `list`, which outlives the call.
+    unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(each), (&raw mut list) as LPARAM) };
+    let found = match want.parse::<usize>() {
+        Ok(n) if n >= 1 => list.get(n - 1).map(|m| m.1),
+        _ => list
+            .iter()
+            .find(|(name, _)| name.trim_start_matches(r"\\.\").eq_ignore_ascii_case(&want))
+            .map(|m| m.1),
+    };
+    if found.is_none() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let names: Vec<&str> = list.iter().map(|m| m.0.as_str()).collect();
+            tracing::warn!(want, ?names, "VICTORY_MONITOR names no monitor: the primary one is used");
+        });
+    }
+    found
 }
 
 /// `width` x `height` scaled down to fit `area`, or unchanged if it fits

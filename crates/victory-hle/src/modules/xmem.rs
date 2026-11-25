@@ -342,7 +342,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section handle and its size in bytes.
+struct Section(HANDLE, usize);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -372,7 +373,7 @@ struct Physical {
     views: BTreeMap<usize, (usize, Slice)>,
     /// Where each page of a section shows in title memory: by the section
     /// (its `Arc`'s address) and the page's index in it, the addresses of
-    /// the 64 KiB pages of views that show it ([`written`]).
+    /// the 64 KiB pages of views that show it ([`shown_at`]).
     shown: HashMap<(usize, usize), Vec<usize>>,
 }
 
@@ -380,9 +381,8 @@ impl Physical {
     /// Notes the view at `base` of `len` bytes showing `slice` onwards in
     /// [`Physical::shown`] (`add`), or takes it out.
     fn note_shown(&mut self, base: usize, len: usize, slice: &Slice, add: bool) {
-        let section = Arc::as_ptr(&slice.section) as usize;
         for k in 0..len / PAGE {
-            let key = (section, slice.index + k);
+            let key = slice.key(k);
             let at = base + k * PAGE;
             if add {
                 self.shown.entry(key).or_default().push(at);
@@ -396,26 +396,25 @@ impl Physical {
     }
 }
 
-/// We wrote bytes `[offset, offset + len)` of the physical pages `pages`
-/// through a view of our own (DirectStorage destinations): the title's
-/// addresses that show those pages saw no write. Neither the write watch
-/// nor the guards there know of it, and a texture placed there was looked
-/// at only if a sampled check happened to catch the change: in run vg28
-/// over 1,000 textures picked by index were found changed after their
-/// upload "with nothing to tell of it", and pieces of textures whose other
-/// parts arrived first stayed stale (blocky patches on clothing). Each
-/// address range showing the bytes is now told, after the bytes landed,
-/// as a write the runtime makes through the kernel is.
-pub(crate) fn written_pages(pages: &[usize], offset: usize, len: usize) {
-    let Some(end) = offset.checked_add(len) else { return };
+/// The title addresses that show bytes `[offset, offset + len)` of `pages`
+/// now, byte for byte, as runs (address, bytes) in address order: a write
+/// to the pages through a view of our own ([`page_window`],
+/// [`write_physical`]) lands there too, and nothing that watches those
+/// addresses sees it (the GPU side's guards fault only on a write at the
+/// guarded address itself). Empty if no view shows them, or if `pages`
+/// has too few pages for the bytes. Byte for byte, not by whole pages: the
+/// title packs several small textures into one page and fills each with a
+/// request of its own.
+pub(crate) fn shown_at(pages: &[usize], offset: usize, len: usize) -> Vec<(usize, usize)> {
+    let Some(end) = offset.checked_add(len) else { return Vec::new() };
     let first = offset / PAGE;
-    let Some(pages) = pages.get(first..end.div_ceil(PAGE)) else { return };
+    let Some(pages) = pages.get(first..end.div_ceil(PAGE)) else { return Vec::new() };
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     {
         let physical = physical();
         for (k, page) in pages.iter().enumerate() {
             let Some(slice) = physical.pages.get(page) else { continue };
-            let Some(shown) = physical.shown.get(&(Arc::as_ptr(&slice.section) as usize, slice.index)) else {
+            let Some(shown) = physical.shown.get(&slice.key(0)) else {
                 continue;
             };
             // The part of this page that was written.
@@ -435,8 +434,23 @@ pub(crate) fn written_pages(pages: &[usize], offset: usize, len: usize) {
             _ => joined.push((at, n)),
         }
     }
-    for (at, n) in joined {
-        victory_gpu::kernel_will_write(at, n);
+    joined
+}
+
+/// We wrote bytes `[offset, offset + len)` of the physical pages `pages`
+/// through a view of our own (DirectStorage destinations): the title's
+/// addresses that show those pages saw no write. Neither the write watch
+/// nor the guards there know of it, and a texture placed there was looked
+/// at only if a sampled check happened to catch the change: in run vg28
+/// over 1,000 textures picked by index were found changed after their
+/// upload "with nothing to tell of it", and pieces of textures whose other
+/// parts arrived first stayed stale (blocky patches on clothing). Each
+/// address range showing the bytes ([`shown_at`]) is now told, after the
+/// bytes landed (`victory_gpu::title_memory_written`: counted, and acted
+/// on unless `VICTORY_PAGE_WRITES=0`). Call without the page table's lock.
+pub(crate) fn written_pages(pages: &[usize], offset: usize, len: usize) {
+    for (at, n) in shown_at(pages, offset, len) {
+        victory_gpu::title_memory_written(at, n, true);
     }
 }
 
@@ -506,7 +520,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
     victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    let section = Arc::new(Section(handle, size));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -538,7 +552,124 @@ pub extern "system" fn XMemFreePhysicalPages(n: usize, pages: *const usize) -> B
         // SAFETY: the title passes `n` page numbers.
         physical.pages.remove(&unsafe { *pages.add(i) });
     }
+    drop(physical);
+    prune_section_views();
     1
+}
+
+/// Whether our own writes into physical pages (DirectStorage's reads,
+/// [`page_window`] and [`write_physical`]) go through one view of each
+/// whole section kept mapped, not a view mapped and unmapped per write
+/// (`VICTORY_KEEP_PAGE_VIEWS=0`: per write, as before).
+///
+/// Every read into physical pages mapped a view and unmapped it when done:
+/// the first touch of each 4 KiB page of a fresh view is a fault, and every
+/// unmap flushes the address from every core running the process (the
+/// title's threads, the recording and submitting threads with them). A
+/// sampled run found a DirectStorage worker in `UnmapViewOfFile` and
+/// `MapViewOfFile` for 61% of its samples, and in run n5q all 24 workers
+/// were busy while fewer than one read the drive, with up to 2,030 reads
+/// waiting.
+fn keep_page_views() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_KEEP_PAGE_VIEWS").is_none_or(|v| v != "0"))
+}
+
+/// A view of a whole section of ours, kept for [`keep_page_views`];
+/// unmapped when the last write through it is done after the section
+/// was let go (it holds the section's memory while mapped).
+struct SectionView {
+    at: MEMORY_MAPPED_VIEW_ADDRESS,
+    len: usize,
+}
+
+// SAFETY: a view of shared memory, usable from any thread; writes through
+// it go to disjoint ranges (each request its own destination).
+unsafe impl Send for SectionView {}
+// SAFETY: as above.
+unsafe impl Sync for SectionView {}
+
+impl Drop for SectionView {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Memory::UnmapViewOfFile;
+        // SAFETY: our view; no window into it is left (each holds an `Arc`).
+        unsafe { UnmapViewOfFile(self.at) };
+    }
+}
+
+/// The kept views, by the section's `Arc` (a `Weak` keeps the address from
+/// being reused for another section while the entry is here).
+static SECTION_VIEWS: Mutex<Vec<(std::sync::Weak<Section>, Arc<SectionView>)>> = Mutex::new(Vec::new());
+
+/// Kept views of sections let go, and ones mapped, since the start.
+static SECTION_VIEW_COUNTS: [AtomicUsize; 2] = [AtomicUsize::new(0), AtomicUsize::new(0)];
+
+/// The kept view of `section`, mapped now if there is none; drops the
+/// entries of sections let go.
+fn section_view(section: &Arc<Section>) -> Option<Arc<SectionView>> {
+    use windows_sys::Win32::System::Memory::{FILE_MAP_WRITE, MapViewOfFile};
+    let mut views = SECTION_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = views.len();
+    views.retain(|(weak, _)| weak.strong_count() > 0);
+    SECTION_VIEW_COUNTS[0].fetch_add(before - views.len(), Ordering::Relaxed);
+    if let Some((_, view)) = views.iter().find(|(weak, _)| std::ptr::eq(weak.as_ptr(), Arc::as_ptr(section))) {
+        return Some(view.clone());
+    }
+    let len = section.1;
+    // SAFETY: a section we own; the view is ours until dropped.
+    let at = unsafe { MapViewOfFile(section.0, FILE_MAP_WRITE, 0, 0, len) };
+    if at.Value.is_null() {
+        return None;
+    }
+    SECTION_VIEW_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+    let view = Arc::new(SectionView { at, len });
+    views.push((Arc::downgrade(section), view.clone()));
+    Some(view)
+}
+
+/// Drops the kept views of sections let go (their memory goes with them).
+fn prune_section_views() {
+    if !keep_page_views() {
+        return;
+    }
+    let mut views = SECTION_VIEWS.lock().unwrap_or_else(|e| e.into_inner());
+    let before = views.len();
+    views.retain(|(weak, _)| weak.strong_count() > 0);
+    SECTION_VIEW_COUNTS[0].fetch_add(before - views.len(), Ordering::Relaxed);
+}
+
+/// A view of our own on consecutive slices of one section, committed and
+/// writable, unmapped when dropped; or, with [`keep_page_views`], the
+/// slices within a kept view of the whole section.
+enum Window {
+    Own(View),
+    Kept(Arc<SectionView>, usize, usize),
+}
+
+impl Window {
+    /// `n` slices from `slice` on.
+    fn map(slice: &Slice, n: usize) -> Option<Window> {
+        if keep_page_views()
+            && let Some(view) = section_view(&slice.section)
+        {
+            let (offset, len) = (slice.index * PAGE, n * PAGE);
+            if offset + len <= view.len && commit(view.at.Value as usize + offset, len) {
+                return Some(Window::Kept(view, offset, len));
+            }
+        }
+        View::map(slice, n).map(Window::Own)
+    }
+
+    fn bytes(&mut self) -> &mut [u8] {
+        match self {
+            Window::Own(view) => view.bytes(),
+            // SAFETY: the kept view holds the section's `len` bytes, these
+            // committed above; the request's destination is its own.
+            Window::Kept(view, offset, len) => unsafe {
+                std::slice::from_raw_parts_mut(view.at.Value.cast::<u8>().add(*offset), *len)
+            },
+        }
+    }
 }
 
 /// A view of our own on consecutive slices of one section, committed and
@@ -628,49 +759,23 @@ pub(crate) fn write_physical(pages: &[usize], offset: usize, data: &[u8]) -> boo
     };
     let (mut within, mut done) = (offset % PAGE, 0);
     for (slice, n) in &runs {
-        let Some(mut view) = View::map(slice, *n) else {
+        let Some(mut view) = Window::map(slice, *n) else {
             return false;
         };
         let k = (n * PAGE - within).min(data.len() - done);
         view.bytes()[within..within + k].copy_from_slice(&data[done..done + k]);
         (within, done) = (0, done + k);
-        written(slice, *n);
     }
     true
-}
-
-/// After writes into `n` pages from `slice` on through a view of our own:
-/// where the title sees those pages, the GPU side has to copy them again (it
-/// does not see such writes).
-fn written(slice: &Slice, n: usize) {
-    let mut shown: Vec<usize> = {
-        let physical = physical();
-        (0..n)
-            .filter_map(|k| physical.shown.get(&slice.key(k)))
-            .flatten()
-            .copied()
-            .collect()
-    };
-    shown.sort_unstable();
-    for run in shown.chunk_by(|a, b| a + PAGE == *b) {
-        victory_gpu::kernel_will_write(run[0], run.len() * PAGE);
-    }
 }
 
 /// Bytes `[offset, offset + len)` of physical pages, writable in place
 /// until dropped: DirectStorage decodes into it instead of a buffer it
 /// would then copy.
 pub(crate) struct PageWindow {
-    view: View,
+    view: Window,
     within: usize,
     len: usize,
-    slice: Slice,
-}
-
-impl Drop for PageWindow {
-    fn drop(&mut self) {
-        written(&self.slice, self.view.len / PAGE);
-    }
 }
 
 impl PageWindow {
@@ -691,10 +796,9 @@ pub(crate) fn page_window(pages: &[usize], offset: usize, len: usize) -> Option<
         return None;
     };
     Some(PageWindow {
-        view: View::map(slice, *n)?,
+        view: Window::map(slice, *n)?,
         within: offset % PAGE,
         len,
-        slice: slice.clone(),
     })
 }
 
@@ -1543,6 +1647,54 @@ mod tests {
         assert_eq!(shown(pages[3]), [at + 3 * PAGE]);
         XMemMapPhysicalPages(base, 8, std::ptr::null());
         assert!(pages.iter().all(|&p| shown(p).is_empty()));
+    }
+
+    /// Pages say where the title has them mapped, byte for byte (after
+    /// fork PR #571's test; its runs are whole pages).
+    #[test]
+    fn pages_say_where_they_are_mapped() {
+        let pages = allocate(3);
+        let reserve = |n: usize| {
+            let at = XMemVirtualAlloc(std::ptr::null_mut(), n * PAGE, MEM_RESERVE | PAGES_64K, 0, PAGE_READWRITE);
+            assert!(!at.is_null());
+            at
+        };
+        // `b` keeps a page unmapped at either end, so that no run at `b`
+        // ever touches one at `a`, wherever the host puts the two.
+        let (a, b) = (reserve(3), reserve(4));
+        assert!(shown_at(&pages, 0, 3 * PAGE).is_empty(), "mapped nowhere");
+        // All three at `a`; the last two at `b`, from its second page on.
+        assert_eq!(XMemMapPhysicalPages(a, 3, pages.as_ptr()), a);
+        let second = b.wrapping_byte_add(PAGE);
+        assert_eq!(XMemMapPhysicalPages(second, 2, pages[1..].as_ptr()), second);
+        let (a, second) = (a as usize, second as usize);
+        let sorted = |mut runs: Vec<(usize, usize)>| {
+            runs.sort_unstable();
+            runs
+        };
+        assert_eq!(shown_at(&pages, 0, PAGE), vec![(a, PAGE)]);
+        // A request for part of a page names those bytes alone.
+        assert_eq!(shown_at(&pages, 0x4000, 0x3000), vec![(a + 0x4000, 0x3000)]);
+        // Across two pages, shown at two addresses each: one run at each.
+        assert_eq!(
+            shown_at(&pages, PAGE + 1, PAGE),
+            sorted(vec![(a + PAGE + 1, PAGE), (second + 1, PAGE)])
+        );
+        // A page unmapped in the middle of a view: the rest still shows.
+        let middle = (a + PAGE) as *mut c_void;
+        assert_eq!(XMemMapPhysicalPages(middle, 1, std::ptr::null()), middle);
+        assert_eq!(
+            shown_at(&pages, 0, 3 * PAGE),
+            sorted(vec![(a, PAGE), (a + 2 * PAGE, PAGE), (second, 2 * PAGE)])
+        );
+        // Too few pages for the bytes: nothing (the write fails too).
+        assert!(shown_at(&pages, 0, 3 * PAGE + 1).is_empty());
+        for (at, n) in [(a, 3), (second, 2)] {
+            let at = at as *mut c_void;
+            assert_eq!(XMemMapPhysicalPages(at, n, std::ptr::null()), at);
+        }
+        assert!(shown_at(&pages, 0, 3 * PAGE).is_empty());
+        assert_eq!(XMemFreePhysicalPages(3, pages.as_ptr()), 1);
     }
 
     #[test]

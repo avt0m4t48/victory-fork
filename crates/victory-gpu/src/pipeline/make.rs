@@ -68,6 +68,8 @@ pub(crate) struct Pending {
 fn left_out(shaders: &[Arc<Shader>]) -> Option<&'static str> {
     if without_structures(shaders) {
         Some("shades ray-tracing hits, left out")
+    } else if for_structures(shaders) {
+        Some("feeds or traces ray-tracing structures, which are not built; left out")
     } else if too_dear(shaders) {
         Some("too dear to compile, left out")
     } else {
@@ -111,6 +113,26 @@ fn without_structures(shaders: &[Arc<Shader>]) -> bool {
         std::env::var_os("VICTORY_RT_RESOLVE").is_some_and(|v| v == "0") && !builder
     });
     out && named(shaders, b"CS_RaytracingResolve")
+}
+
+/// Whether a shader only feeds the console's ray-tracing structures or
+/// traces rays through them, while the structure builder is off (so they
+/// are never built): the title's `bvh_skinning` passes
+/// (`CSComputeSkinning*`, every program of that name is one: they skin
+/// characters into the structures' vertex buffers) and the screen-probe
+/// ray tracers that walk them (`CS_ScreenProbes_TraceRays_*_BVH_*`; the
+/// `Fallback` and `Voxels` tracers stay). On an RTX 5070 they took 89 ms
+/// of the card's 318 a world frame (skinning 37 and 20 ms, the tracer
+/// 32); without them the frame went from about 730 to 600-690 ms (one 300
+/// s run, no crash). `VICTORY_BVH_PASSES=1` makes them as before.
+fn for_structures(shaders: &[Arc<Shader>]) -> bool {
+    static OUT: OnceLock<bool> = OnceLock::new();
+    let out = *OUT.get_or_init(|| {
+        let builder = std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1");
+        std::env::var_os("VICTORY_BVH_PASSES").is_none_or(|v| v != "1") && !builder
+    });
+    out && (named(shaders, b"CSComputeSkinning")
+        || named(shaders, b"CS_ScreenProbes_TraceRays") && named(shaders, b"_BVH_"))
 }
 
 // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
@@ -648,7 +670,17 @@ fn big_workers() -> usize {
 
 /// The workers [`workers`] starts: half the logical processors, 2 to 8.
 fn worker_count() -> usize {
-    std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+    // `VICTORY_PIPELINE_WORKERS` sets it (1-64): with the pipeline library
+    // warm most "makes" are loads, and 421 big ones of 100-136 ms each at
+    // the start of run n5e went five at a time.
+    static N: OnceLock<usize> = OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_PIPELINE_WORKERS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .map(|n| n.clamp(1, 64))
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)))
+    })
 }
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue::new());

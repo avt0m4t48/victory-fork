@@ -132,12 +132,77 @@ pub(crate) enum C {
     /// copies could be if only the written 4 KiB pages of a unit went.
     DirtyKernelPages,
     DirtyUnits,
+    /// Of `Watches`: askings for a submission's ranges together (`ask_ahead`,
+    /// `ask_once`); and askings the kernel refused (a range across more than
+    /// one reservation, asked again in halves) with their microseconds.
+    WatchesAhead,
+    WatchFails,
+    WatchFailUs,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
+    /// Askings for a submission's ranges together left out for the same
+    /// reason, with `VICTORY_ASK_SKIP_VIEWS=1` (each one a refused kernel
+    /// call without it, counted in `WatchFails`).
+    AskSkippedViews,
+    /// Preparing a submission on the submitting thread, by part, in
+    /// microseconds (settles left out): the one asking for all its ranges
+    /// (`watch::ask_once`), its lists' steps (refreshes flushed before the
+    /// title's buffer copies and before ranges given to shaders, fills,
+    /// textures), the last flush of refreshes (with the fills taken from
+    /// copies and the card's fills), and the snapshots and the copies in
+    /// the card's memory after it. Run n5h left 63 of the 158 ms of
+    /// "preparing" a frame in no counter.
+    PrepAskUs,
+    PrepStepsUs,
+    PrepFlushUs,
+    PrepCardUs,
+    /// Of the steps: fills of upload memory (finding the source's copy, or
+    /// reading title memory), nanoseconds; ranges given to shaders (that
+    /// copy's refresh first, then the snapshot), microseconds.
+    PrepFillNs,
+    PrepGpuWriteUs,
+    /// Nanoseconds waited for the write-watch journal's lock (every taking
+    /// of it; with `VICTORY_JOURNAL_SHARDS=1`, of the shards an asking
+    /// needs) and for the guards' lock in `watch::guard`, on every thread:
+    /// with one lock the threads of a wide refresh ask one after the other.
+    JournalLockNs,
+    GuardLockNs,
+    /// Guard checks that found a block of their range not clean (a walk
+    /// over the range, guarding again what was written), and the
+    /// nanoseconds of the protection changes they made.
+    GuardSlow,
+    GuardProtectNs,
+    /// Pieces of copies in the card's memory our hash passes hashed a
+    /// group a piece (`VICTORY_CARD_HASH_WIDE=1`, `crate::host`), after
+    /// ranges were sent up and in the compares after the lists.
+    CardPiecesWide,
+    /// Indirect executions that ran on clamped records (`crate::draw`), of
+    /// them those that read records a window clamped ahead with no pass of
+    /// their own (`VICTORY_INDIRECT_BATCH=1`), and windows a title command
+    /// that may write memory ended (`State::end_window`).
+    IndirectCovered,
+    IndirectFromWindow,
+    IndirectWindowCut,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 96;
+const _: () = assert!((C::IndirectWindowCut as usize) < COUNTERS);
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
     COUNT[c as usize].fetch_add(n, Relaxed);
+}
+
+/// What [`log`] took out of each counter so far: with the counter, its
+/// total since the start, for the live profiler (`crate::live`).
+static SWAPPED: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
+
+/// Each counter's total since the start.
+pub(crate) fn totals() -> Vec<u64> {
+    COUNT.iter().zip(&SWAPPED).map(|(c, s)| s.load(Relaxed) + c.load(Relaxed)).collect()
 }
 
 /// How copies run: 0 guarded (as always), 1 plain, 2 not at all.
@@ -748,6 +813,22 @@ fn log_memory() {
         mb(card[0]),
         mb(card[3]),
     );
+    let targets = crate::resource::targets_census();
+    tracing::info!(
+        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
+        targets[0],
+        mb(targets[1]),
+        targets[10],
+        mb(targets[11]),
+        targets[2],
+        mb(targets[3]),
+        targets[4],
+        mb(targets[5]),
+        targets[6],
+        mb(targets[7]),
+        targets[8],
+        mb(targets[9]),
+    );
     tracing::info!(
         "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
          {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
@@ -963,6 +1044,110 @@ fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
 }
 
 /// A list call on this thread that began at `started` has returned.
+/// Diagnostics: list-call time by the list call it was (the call site in
+/// `list.rs` that took the draw state), summed over all recording threads;
+/// a table of the costliest every 20 s ([`recorded_at`]).
+static SITES: Mutex<Option<std::collections::HashMap<usize, (&'static std::panic::Location<'static>, u64, u64)>>> =
+    Mutex::new(None);
+
+thread_local! {
+    /// This thread's [`SITES`] additions not yet added, and their time.
+    static SITES_HERE: std::cell::RefCell<(std::collections::HashMap<usize, (&'static std::panic::Location<'static>, u64, u64)>, u64)> =
+        std::cell::RefCell::new((std::collections::HashMap::new(), 0));
+}
+
+/// Diagnostics: time in the parts of preparing a draw or dispatch, summed
+/// over all threads (nanoseconds): 0 pipeline lookup, 1 vertex and index
+/// buffers and target states, 2 textures picked by index, 3 heaps, root
+/// signature and pipeline (and the root views of earlier stages), 4
+/// descriptor tables, 5 user data and root constant and shader views, 6
+/// root unordered access views; 7 of 5, title memory by address made ready.
+static PHASES: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Diagnostics: the parts of a draw's descriptor tables (`State::tables`),
+/// summed over all threads: 0 nanoseconds in entries read from the title's
+/// slots, 1 in tables found made earlier in the list, 2 in tables made
+/// afresh; 3 constant buffer entries of the made tables, 4 entries read
+/// from the title's slots, 5 tables found, 6 tables made, 7 slots of the
+/// made tables.
+static TABLE_PARTS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+
+/// Adds `v` to [`TABLE_PARTS`] `n`.
+pub(crate) fn table_part(n: usize, v: u64) {
+    TABLE_PARTS[n].fetch_add(v, Relaxed);
+}
+
+/// Adds the time since `since` to phase `n`.
+pub(crate) fn phase_add(n: usize, since: std::time::Instant) {
+    PHASES[n].fetch_add(since.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// Adds the time since `*at` to phase `n` and restarts `*at`.
+pub(crate) fn phase(n: usize, at: &mut std::time::Instant) {
+    let now = std::time::Instant::now();
+    PHASES[n].fetch_add((now - *at).as_nanos() as u64, Relaxed);
+    *at = now;
+}
+
+pub(crate) fn recorded_at(started: std::time::Instant, site: &'static std::panic::Location<'static>) {
+    let ns = started.elapsed().as_nanos() as u64;
+    let full = SITES_HERE.with(|h| {
+        let mut h = h.borrow_mut();
+        let e = h.0.entry(std::ptr::from_ref(site) as usize).or_insert((site, 0, 0));
+        e.1 += ns;
+        e.2 += 1;
+        h.1 += ns;
+        if h.1 < 5_000_000 {
+            return None;
+        }
+        h.1 = 0;
+        Some(std::mem::take(&mut h.0))
+    });
+    let Some(here) = full else { return };
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let mut all = SITES.lock().unwrap_or_else(|e| e.into_inner());
+    let all = all.get_or_insert_with(Default::default);
+    for (k, (s, t, n)) in here {
+        let e = all.entry(k).or_insert((s, 0, 0));
+        e.1 += t;
+        e.2 += n;
+    }
+    let now = now_us();
+    if now < LAST.load(Relaxed) + 20_000_000 {
+        return;
+    }
+    LAST.store(now, Relaxed);
+    let mut rows: Vec<_> = all.values().copied().collect();
+    rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let total: u64 = rows.iter().map(|r| r.1).sum::<u64>().max(1);
+    let table: Vec<String> = rows
+        .iter()
+        .take(12)
+        .map(|(s, t, n)| format!("list.rs:{} {:.0}% {:.1} us x{}", s.line(), *t as f64 * 100.0 / total as f64, *t as f64 / 1e3 / (*n).max(1) as f64, n))
+        .collect();
+    tracing::info!("list-call time by call, since the last table: {}", table.join("; "));
+    let phases: Vec<String> = PHASES.iter().map(|p| format!("{:.0}", p.swap(0, Relaxed) as f64 / 1e6)).collect();
+    tracing::info!(
+        "draw preparing since the last table, ms (pipeline lookup, vertex/index/targets, indexed textures, heaps/root/pso, tables, user data + root CBV/SRV, root UAVs; of user data, memory by address): {}",
+        phases.join(", ")
+    );
+    let t = TABLE_PARTS.each_ref().map(|p| p.swap(0, Relaxed));
+    tracing::info!(
+        "descriptor tables since the last table: {:.0} ms in {} entries read from the title's slots; {:.0} ms in {} tables found made \
+         earlier in their list; {:.0} ms in {} tables made afresh ({} slots, {:.1} a table; {} constant buffer entries)",
+        t[0] as f64 / 1e6,
+        t[4],
+        t[1] as f64 / 1e6,
+        t[5],
+        t[2] as f64 / 1e6,
+        t[6],
+        t[7],
+        t[7] as f64 / t[6].max(1) as f64,
+        t[3]
+    );
+    all.clear();
+}
+
 pub(crate) fn recorded(started: std::time::Instant) {
     let ns = started.elapsed().as_nanos() as u64;
     add(C::RecordCalls, 1);
@@ -1065,7 +1250,12 @@ pub(crate) fn log(frames: f64) {
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
     let c: Vec<f64> = COUNT
         .iter()
-        .map(|a| a.swap(0, Relaxed) as f64 / frames)
+        .zip(&SWAPPED)
+        .map(|(a, s)| {
+            let v = a.swap(0, Relaxed);
+            s.fetch_add(v, Relaxed);
+            v as f64 / frames
+        })
         .collect();
     let mb = |v: f64| v / 1e6;
     let ms = |v: f64| v / 1e3;
@@ -1075,7 +1265,8 @@ pub(crate) fn log(frames: f64) {
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
          unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
          changed, {:.1} MB hashed, {:.1} MB of them changed; written as the kernel tells it: \
-         {:.1} MB in 4 KiB pages, {:.1} MB in 64 KiB units",
+         {:.1} MB in 4 KiB pages, {:.1} MB in 64 KiB units; askings: {:.0} for submissions' ranges \
+         together, {:.0} refused {:.2} ms",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1101,6 +1292,30 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::TexChanged as usize]),
         mb(c[C::DirtyKernelPages as usize] * 4096.0),
         mb(c[C::DirtyUnits as usize] * 65536.0),
+        c[C::WatchesAhead as usize],
+        c[C::WatchFails as usize],
+        ms(c[C::WatchFailUs as usize]),
+    );
+    tracing::info!(
+        "preparing per frame by part (submitting thread, settles left out): the one asking for \
+         the submissions' ranges {:.1} ms, the lists' steps {:.1} ms (fills {:.1} ms, ranges given \
+         to shaders with their copy's refresh {:.1} ms), the last flush {:.1} ms, snapshots and \
+         card copies {:.1} ms; askings for ranges together left out as guarded view memory \
+         {:.0} (VICTORY_ASK_SKIP_VIEWS=1; the kernel refuses them); waiting for the journal's \
+         lock {:.1} ms (its shards with VICTORY_JOURNAL_SHARDS=1) and the guards' lock {:.1} ms \
+         (all threads); guard checks that walked \
+         their range {:.0}, guarding again {:.1} ms",
+        ms(c[C::PrepAskUs as usize]),
+        ms(c[C::PrepStepsUs as usize]),
+        c[C::PrepFillNs as usize] / 1e6,
+        ms(c[C::PrepGpuWriteUs as usize]),
+        ms(c[C::PrepFlushUs as usize]),
+        ms(c[C::PrepCardUs as usize]),
+        c[C::AskSkippedViews as usize],
+        c[C::JournalLockNs as usize] / 1e6,
+        c[C::GuardLockNs as usize] / 1e6,
+        c[C::GuardSlow as usize],
+        c[C::GuardProtectNs as usize] / 1e6,
     );
     tracing::info!(
         "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
@@ -1131,9 +1346,11 @@ pub(crate) fn log(frames: f64) {
     );
     let [together, written, mapped] =
         [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
+    let hot = crate::watch::HOT_LEFT.load(std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
         "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped; \
+         {hot} hot blocks left writable at checks (VICTORY_GUARD_HOT)"
     );
     // Where the wall clock of a frame goes: the phases of a frame, the
     // processor time of the whole process, and what each submitting and
@@ -1257,6 +1474,12 @@ pub(crate) fn log(frames: f64) {
         );
     }
     tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway)",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+    );
+    tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
          such waits each); barrier experiment {}",
@@ -1264,6 +1487,15 @@ pub(crate) fn log(frames: f64) {
         c[C::WaitsForBuffers as usize],
         c[C::IndirectBounded as usize],
         barrier_test()
+    );
+    tracing::info!(
+        "  indirect executions per frame on clamped records: {:.0}, of them {:.0} from a window clamped \
+         ahead with no pass of their own; {:.0} windows ended by a title command that may write memory \
+         (hardened windows only); windows now: {}",
+        c[C::IndirectCovered as usize],
+        c[C::IndirectFromWindow as usize],
+        c[C::IndirectWindowCut as usize],
+        crate::draw::batched()
     );
     // What is compared after submissions, largest first, and how much of
     // it shaders had written.

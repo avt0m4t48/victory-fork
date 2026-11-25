@@ -85,6 +85,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         if !event.is_null() {
             set_event(event as usize);
         }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        crate::live::waiter_met();
         return S_OK;
     }
     if event.is_null() {
@@ -106,6 +108,8 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
         tracing::warn!(value, "blocking fence wait not implemented");
         return E_NOTIMPL;
     }
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::live::waiter_added(this as usize, value);
     waiters.push((value, event as usize));
     S_OK
 }
@@ -114,6 +118,8 @@ pub(crate) fn set(this: This, value: u64) {
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
+    #[cfg(all(windows, feature = "diagnostics"))]
+    crate::live::fence_set(this as usize, value);
     waiters.retain(|&(wanted, event)| {
         let reached = wanted <= value;
         if reached {

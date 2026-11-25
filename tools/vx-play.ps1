@@ -5,7 +5,8 @@
 #   powershell -ExecutionPolicy Bypass -File tools\vx-play.ps1 -GameExe "<game folder>\<title exe>"
 #   ... -Config <victory.toml>   config file (default: victory.toml next to the repository root)
 #   ... -Exe <victory.exe>       build to run (default: target\release\victory.exe)
-#   ... -SeriesS                 the Series S profile (its FSR4 upscaler does not run on NVIDIA yet)
+#   ... -SeriesS                 the Series S profile (the title keeps its own upscaler and both present planes
+#                                are composed; before that fix its window stayed black)
 #   ... -NoSpeedSwitches         the fork's defaults instead of the settings below
 #   ... -NoWide                  without VICTORY_WAVE_WIDE_ONLY (faster, but unlit characters and rooms)
 #   ... -NoOverlay               without the status bar (tools\vx-overlay.py, needs Python 3 with Tk) that sits on
@@ -39,6 +40,9 @@ $env:VICTORY_TEXTURE_HOT = '1'
 # the visibility and tiled light-list passes run as 32-lane waves on 32-lane GPUs (NVIDIA); without this
 # they are refused and dropped, and characters and rooms render unlit. Drop with -NoWide for speed.
 if (-not $NoWide) { $env:VICTORY_WAVE_WIDE_ONLY = '369cbe906ea72764,2cc4c197ee29e291' }
+# the skinning and screen-probe ray-tracing passes the build leaves out by default are made: without them,
+# on an RTX 4090, an open-water mission had no volumetric clouds, no water waves and an unlit boat
+$env:VICTORY_BVH_PASSES = '1'
 if (-not $NoSpeedSwitches) {
     # texture refreshes read title memory through the kernel instead of waiting for the title's remaps
     $env:VICTORY_TEXTURE_NO_WAIT = '1'

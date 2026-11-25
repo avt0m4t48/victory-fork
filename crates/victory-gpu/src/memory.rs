@@ -73,8 +73,10 @@ struct Memory {
     heaps: HashMap<usize, (u32, u32)>,
     /// The frame the faults were last read in.
     frame: u64,
-    /// Pages asked for this frame that are not the title's memory.
+    /// Pages asked for that are not the title's memory, since the frame in
+    /// `refused_at` ([`refused_frames`]).
     refused: std::collections::HashSet<u64>,
+    refused_at: u64,
 }
 
 // SAFETY: the mappings are of buffers the struct owns; all access is under
@@ -111,6 +113,7 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
+            refused_at: 0,
         })
     }
 
@@ -221,6 +224,8 @@ impl Memory {
             }
         }
         for page in pages {
+            // A page shaders reached is asked about again, refused or not.
+            self.refused.remove(&u64::from(page));
             self.map(u64::from(page) * PAGE);
         }
     }
@@ -231,6 +236,22 @@ impl Memory {
         self.map(address);
         self.map((address & !(CELL - 1)) + CELL);
     }
+}
+
+/// Frames the pages found not to be the title's memory stay refused
+/// without being asked about again (`VICTORY_MEMORY_REFUSED_FRAMES`,
+/// default 120; 1: every frame, as before). Every root constant from
+/// 0x0100_0000 up is taken for an address in 256-byte units, and nearly
+/// every positive float is one: each distinct page was asked about
+/// (`VirtualQuery`, which walks the page tables to the region's end) once a
+/// frame, under the one lock all recording threads take here (run s21:
+/// dispatches and indirect executions at ~90 us each). A page shaders
+/// fault on is asked about again at once ([`Memory::take_faults`]).
+fn refused_frames() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("VICTORY_MEMORY_REFUSED_FRAMES").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120).max(1)
+    })
 }
 
 /// Before a draw whose shader reads title memory by address: what its
@@ -254,7 +275,10 @@ pub(crate) fn ready(
     let frame = crate::frame::current();
     if m.frame != frame {
         m.frame = frame;
-        m.refused.clear();
+        if frame >= m.refused_at + refused_frames() {
+            m.refused.clear();
+            m.refused_at = frame;
+        }
         m.take_faults();
     }
     let numbered = m.copies.len();

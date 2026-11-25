@@ -142,7 +142,10 @@ const _: () = assert!(offset_of!(List, pipeline_shadow) + 32 == 0x560);
 /// Runs `f` with the host list and draw state of a title list, if there
 /// is a host GPU.
 #[cfg(windows)]
+#[track_caller]
 fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::draw::State)) {
+    #[cfg(feature = "diagnostics")]
+    let site = std::panic::Location::caller();
     let Some(list) = host_list(this) else { return };
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
@@ -150,7 +153,29 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     let state = unsafe { &(*this.cast::<List>()).state };
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(feature = "diagnostics")]
-    crate::copystat::recorded(started);
+    {
+        crate::copystat::recorded_at(started, site);
+        crate::copystat::recorded(started);
+    }
+    #[cfg(feature = "diagnostics")]
+    crate::profile::seen(crate::profile::Seen::Record);
+}
+
+/// The title records a command that may write memory, or closes the list:
+/// a window of indirect records clamped ahead ends before it
+/// ([`crate::draw::State::end_window`]). Called first, before the command
+/// takes the list's state itself. The commands that call it: buffer,
+/// texture, resource and memory copies, resolves, clears, query resolves,
+/// bottom-of-pipe writes, waits for memory values (before their cut), the
+/// close. Barriers and state calls write nothing and do not.
+#[cfg(windows)]
+fn end_window(this: This) {
+    if host_list(this).is_none() {
+        return;
+    }
+    // SAFETY: the title passes one of our lists.
+    let state = unsafe { &(*this.cast::<List>()).state };
+    state.lock().unwrap_or_else(|e| e.into_inner()).end_window();
 }
 
 /// The submission of `lists` has run: each gives its descriptor tables'
@@ -222,7 +247,12 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 /// between them (a list keeps scratch chunks over a reset only while lists
 /// do not share them, `VICTORY_SCRATCH_POOL=0`).
 #[cfg(windows)]
-const IDLE_MOST: (usize, u64) = (128, 256 << 20);
+// (512 since run 221: with submissions prepared by a thread of ours the
+// title has its lists back at once and resets them while the flights of
+// the frame before are still in the air, so more than 128 are out at a
+// time: 80 host lists were made and as many thrown away every frame,
+// 8 ms to make and more to free, on the thread that submits.)
+const IDLE_MOST: (usize, u64) = (512, 256 << 20);
 
 /// Whether host lists that have run are used again (on by default;
 /// `VICTORY_LIST_POOL=0`: each is made new and thrown away, as before).
@@ -619,6 +649,8 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    end_window(this);
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -805,6 +837,78 @@ fn buffer_range(buffer: This, offset: u64, len: u64) -> Option<*mut u8> {
     Some(unsafe { data.add(offset as usize) })
 }
 
+/// Whether title buffer copies whose bytes shaders may be writing are done
+/// by the card (`VICTORY_CARD_COPY`, on by default; `0`: all at
+/// submission, as before).
+#[cfg(windows)]
+fn card_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_CARD_COPY").is_none_or(|v| v != "0"))
+}
+
+/// A title buffer copy of `len` bytes from `src` to `dst` (title memory)
+/// done by the card, in the list's order, between the two buffers' host
+/// copies, when shaders may write either range before the list runs
+/// ([`crate::host::shaders_may_write`]): flights in the air, or the list's
+/// own shaders. The destination's range is copied back into title memory
+/// once the list has run, as shader writes are. True if it was recorded.
+///
+/// At submission the copy waited for every flight that may write either
+/// range to land (run d17: once a frame, ~100 ms, the card's whole queue),
+/// and a copy behind the list's own shader writes took the bytes from
+/// before them. On the console the card does the copy when it reaches it.
+#[cfg(windows)]
+fn card_copy(list: &crate::host::HostList, dst: usize, src: usize, len: u64) -> bool {
+    if len == 0 || !card_copies() {
+        return false;
+    }
+    let n = len as usize;
+    let (Some(from), Some(to)) = (crate::shadow::find(src as u64, len), crate::shadow::find(dst as u64, len)) else {
+        return false;
+    };
+    // Flights in the air now, the list's own shaders, or shaders that wrote
+    // either copy lately: a flight sent between this recording and the
+    // list's submission would make the copy at submission wait (run s18:
+    // 107 waits of ~100 ms for 2 KB copies out of a buffer shaders write
+    // every frame).
+    if !crate::host::shaders_may_write(list, src, src + n)
+        && !crate::host::shaders_may_write(list, dst, dst + n)
+        && !from.gpu_written_lately()
+        && !to.gpu_written_lately()
+    {
+        return false;
+    }
+    // One buffer cannot be source and destination at once; title memory in
+    // place is written behind write watching's back.
+    if std::sync::Arc::ptr_eq(&from, &to) || from.in_place() || to.in_place() {
+        return false;
+    }
+    from.refresh(list, src as u64, len);
+    to.refresh(list, dst as u64, len);
+    to.gpu_writes(list, dst as u64, len);
+    #[cfg(feature = "diagnostics")]
+    {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let k = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        if k.is_power_of_two() {
+            tracing::info!(k, len, src = format_args!("{src:#x}"), dst = format_args!("{dst:#x}"), "title buffer copies done by the card");
+        }
+    }
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
+    // SAFETY: the same layout as the host's barrier.
+    let wait = unsafe { std::mem::transmute::<Barrier, D3D12_RESOURCE_BARRIER>(UAV_BARRIER) };
+    // SAFETY: an open list and two live buffers, the ranges inside them.
+    // The barriers: shader writes before it are done before the copy reads,
+    // and the copy is done before what follows reads (buffers have no
+    // tracked state; the title's own buffer barriers wait the same way).
+    unsafe {
+        list.list.ResourceBarrier(std::slice::from_ref(&wait));
+        list.list.CopyBufferRegion(&to.buffer, to.offset(dst as u64), &from.buffer, from.offset(src as u64), len);
+        list.list.ResourceBarrier(std::slice::from_ref(&wait));
+    }
+    true
+}
+
 /// Buffer to buffer: both are host memory, copied at submission.
 extern "system" fn copy_buffer_region(
     this: This,
@@ -815,10 +919,15 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    end_window(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
     {
+        if card_copy(list, to as usize, from as usize, len) {
+            return;
+        }
         list.defer_copy(to, from, len as usize);
     }
     #[cfg(not(windows))]
@@ -843,6 +952,7 @@ fn unlike(dst: This, src: This) -> bool {
 extern "system" fn copy_resource(this: This, dst: This, src: This) {
     #[cfg(windows)]
     {
+        end_window(this);
         let Some(list) = host_list(this) else {
             return;
         };
@@ -861,6 +971,9 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
             // Depth textures shaders also write: what they wrote, first.
             list.twin_use(dst, false, true);
             list.twin_use(src, false, false);
+            // A destination made level by level gets its levels' memory
+            // ahead of this list (`crate::tiles`).
+            crate::texture::card_writes(list, dst, to, None);
             ensure_state(list, dst, COPY_DEST);
             ensure_state(list, src, COPY_SOURCE);
             crate::texture::host_written(dst);
@@ -907,6 +1020,7 @@ extern "system" fn copy_texture_region(
 ) {
     #[cfg(windows)]
     {
+        end_window(this);
         use windows::Win32::Graphics::Direct3D12::{D3D12_BOX, D3D12_TEXTURE_COPY_LOCATION};
         use windows::core::Interface;
         const FOOTPRINT: u32 = 1;
@@ -994,6 +1108,11 @@ extern "system" fn copy_texture_region(
         // A depth texture shaders also write: what they wrote, first (the
         // source above too).
         list.twin_use(dst.resource, false, true);
+        // A destination made level by level gets the level's memory ahead
+        // of this list (`crate::tiles`): the title's bake copies each level
+        // of its result into a block-compressed texture of that kind, and
+        // a copy into a level without memory is dropped.
+        crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
         ensure_state(list, dst.resource, COPY_DEST);
         crate::texture::host_written(dst.resource);
         let mut to_location = dst;
@@ -1127,6 +1246,8 @@ extern "system" fn resolve(
     format: u32,
 ) {
     #[cfg(windows)]
+    end_window(this);
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
@@ -1147,6 +1268,8 @@ extern "system" fn resolve(
         // Depth textures shaders also write: what they wrote, first.
         list.twin_use(dst, false, true);
         list.twin_use(src, false, false);
+        // As for a copy (`crate::tiles`).
+        crate::texture::card_writes(list, dst, to, Some(dst_sub));
         ensure_state(list, dst, RESOLVE_DEST);
         ensure_state(list, src, RESOLVE_SOURCE);
         crate::texture::host_written(dst);
@@ -1202,6 +1325,7 @@ extern "system" fn clear_rtv(
 ) {
     #[cfg(windows)]
     {
+        end_window(this);
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::rtv_record(handle))
         else {
             return;
@@ -1252,6 +1376,7 @@ extern "system" fn clear_dsv(
 ) {
     #[cfg(windows)]
     {
+        end_window(this);
         use windows::Win32::Graphics::Direct3D12::D3D12_CLEAR_FLAGS;
         let (Some(list), Some(record)) = (host_list(this), crate::descriptor::dsv_record(handle))
         else {
@@ -1286,9 +1411,166 @@ extern "system" fn clear_dsv(
     let _ = (this, handle, flags, depth, stencil, count, rects);
 }
 
+/// `ClearUnorderedAccessViewUint(view in the bound heap, the view's record,
+/// resource, four values, count, rects)` (slot 0x1a8; `crate::clear`).
+extern "system" fn clear_uav_uint(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, cpu, resource, values, count, rects, false);
+}
+
+/// `ClearUnorderedAccessViewFloat`, as [`clear_uav_uint`] with four floats
+/// (slot 0x1b0).
+extern "system" fn clear_uav_float(
+    this: This,
+    gpu: u64,
+    cpu: u64,
+    resource: This,
+    values: *const [u32; 4],
+    count: u32,
+    rects: *const Rect,
+) {
+    clear_uav(this, gpu, cpu, resource, values, count, rects, true);
+}
+
+/// Both unordered access clears (`crate::clear`). Their arguments are taken
+/// from PC's and not yet seen in a run: every pointer is checked to be
+/// mapped before it is read, the view record must be one of ours and name
+/// the resource passed, and the first calls are logged as read.
+#[allow(clippy::too_many_arguments)] // the methods' own arguments
+fn clear_uav(this: This, gpu: u64, cpu: u64, resource: This, values: *const [u32; 4], count: u32, rects: *const Rect, float: bool) {
+    #[cfg(windows)]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let counts = &crate::clear::UAV_CLEARS;
+        counts[0].fetch_add(1, Relaxed);
+        let readable = |at: u64, len: usize| at != 0 && crate::texture::committed(at as *const u8, len);
+        let view = if readable(cpu, 12) { crate::descriptor::view(cpu) } else { None };
+        let values = readable(values as u64, 16)
+            // SAFETY: four mapped words.
+            .then(|| unsafe { values.read_unaligned() });
+        // `None`: rectangles that cannot be read (the clear is left out,
+        // not made whole).
+        let rects: Option<Vec<[i32; 4]>> = if count == 0 {
+            Some(Vec::new())
+        } else if count <= 4096 && readable(rects as u64, count as usize * 16) {
+            // SAFETY: `count` mapped rectangles of four words.
+            Some(unsafe { std::slice::from_raw_parts(rects.cast::<[i32; 4]>(), count as usize) }.to_vec())
+        } else {
+            None
+        };
+        // The texture and its view words: of a view of a resource object,
+        // or of a texture the title placed in its memory.
+        // A placed view's resource is made (`texture_at`) only when the
+        // clear is done: logged, its description stands for it.
+        let placed = match &view {
+            Some(crate::descriptor::View::Placed(true, desc, words)) => Some((*desc, *words)),
+            _ => None,
+        };
+        let (target, words) = match (&view, placed) {
+            (Some(crate::descriptor::View::Unordered(r, _, words)), _) => (*r as This, *words),
+            (_, Some((desc, words))) if desc[0] != 1 && crate::clear::wanted() => {
+                let address = u64::from(words[10]) | u64::from(words[11]) << 32;
+                let r = crate::resource::texture_at(address, &desc).unwrap_or(std::ptr::null());
+                (r, words[..10].try_into().ok())
+            }
+            _ => (std::ptr::null(), None),
+        };
+        let buffer = placed.is_some_and(|(desc, _)| desc[0] == 1)
+            || !target.is_null() && crate::resource::buffer_bytes(target).is_some();
+        static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if SAID.fetch_add(1, Relaxed) < 8 {
+            tracing::info!(
+                float,
+                gpu = format_args!("{gpu:#x}"),
+                cpu = format_args!("{cpu:#x}"),
+                resource = ?resource,
+                view_resource = ?target,
+                same_resource = target == resource,
+                buffer,
+                view = ?words,
+                placed = ?placed,
+                values = ?values,
+                count,
+                rects = ?rects,
+                doing = crate::clear::wanted(),
+                "an unordered access view clear (VICTORY_UAV_CLEAR=1 does it)"
+            );
+        }
+        if !crate::clear::wanted() {
+            counts[2].fetch_add(1, Relaxed);
+            return;
+        }
+        if buffer {
+            counts[3].fetch_add(1, Relaxed);
+            return;
+        }
+        let done = (|| {
+            let values = values?;
+            // A resource argument that names another resource than the
+            // view's: the arguments are not what they are taken for.
+            if target.is_null() || (!resource.is_null() && target != resource && of_resource_object(&view)) {
+                return None;
+            }
+            if crate::resource::depth_and_unordered(target) {
+                return None;
+            }
+            let list = host_list(this)?;
+            let host = crate::host::host()?;
+            let texture = crate::resource::host_resource(target)?;
+            // SAFETY: a live resource.
+            let desc = unsafe { texture.GetDesc() };
+            let own = desc.Format.0 as u32;
+            let format = match words.map_or(0, |w| w[0]) {
+                0 => own,
+                f => {
+                    let f = crate::resource::pc_format(f);
+                    if crate::resource::stands_in(target) { crate::resource::target_format(f) } else { f }
+                }
+            };
+            let texel = crate::clear::texel(format, values, float)?;
+            let element = crate::resource::element(own).filter(|&(_, block)| block == 1)?.0;
+            if texel.len() as u64 != element {
+                return None;
+            }
+            let copies = crate::clear::plan(words.as_ref(), &desc, rects.as_ref()?)?;
+            // It writes memory: a window of indirect records ends first, as
+            // at the other clears.
+            end_window(this);
+            list.texture_written(target);
+            ensure_state(list, target, 0x400);
+            #[cfg(feature = "diagnostics")]
+            list.note_op(|| format!("unordered access clear of {target:?}: {} copies", copies.len()));
+            // SAFETY: an open list; the texture is live, in the copy
+            // destination state, of format `own` with elements the texel's
+            // size, and the plan's boxes lie in its subresources.
+            unsafe { crate::clear::record(&list.list, texture, desc.Format, &texel, &copies, |bytes| list.upload(host, bytes)) }
+                .then_some(())
+        })();
+        counts[if done.is_some() { 1 } else { 4 }].fetch_add(1, Relaxed);
+    }
+    #[cfg(not(windows))]
+    let _ = (this, gpu, cpu, resource, values, count, rects, float);
+}
+
+/// Whether the record is of a view of a resource object (whose resource
+/// the clear's argument must be); a placed view has none to pass.
+#[cfg(windows)]
+fn of_resource_object(view: &Option<crate::descriptor::View>) -> bool {
+    matches!(view, Some(crate::descriptor::View::Unordered(..)))
+}
+
 /// `CopyMemoryToMemoryX(destination, source, size, flags)`: GPU addresses
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
+    #[cfg(windows)]
+    end_window(this);
     #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
@@ -1349,6 +1631,8 @@ extern "system" fn resolve_queries(
     const BINARY: u32 = 1;
     const TIMESTAMP: u32 = 2;
     const PIPELINE_STATISTICS: u32 = 3;
+    #[cfg(windows)]
+    end_window(this);
     let Some((data, size)) = crate::resource::buffer_bytes(buffer) else {
         return;
     };
@@ -1883,6 +2167,9 @@ pub(crate) fn waits_by_list(lists: &[This]) -> Vec<Vec<ValueWait>> {
 }
 
 fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: bool) {
+    // Before the cut, in the host list the window's records were clamped in.
+    #[cfg(windows)]
+    end_window(this);
     let wait = ValueWait {
         address,
         comparison,
@@ -1959,10 +2246,14 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
 /// 64 bits: done when the list has run, as the GPU would. Flag 1 writes the
 /// GPU timestamp instead (64-bit form), flag 2 the system timestamp.
 extern "system" fn write32(this: This, address: u64, value: u32, _flush: u32, _flags: u32) {
+    #[cfg(windows)]
+    end_window(this);
     defer_write(this, address, Written::Value(u64::from(value)), 4);
     value_written(this, address, u64::from(value));
 }
 extern "system" fn write64(this: This, address: u64, value: u64, _flush: u32, flags: u32) {
+    #[cfg(windows)]
+    end_window(this);
     const GPU_TIMESTAMP: u32 = 1;
     const SYSTEM_TIMESTAMP: u32 = 2;
     let what = match flags {
@@ -2105,7 +2396,9 @@ const METHODS: [(usize, *const ()); 52] = [
     (127, state::dispatch_mesh as *const ()),     // 0x3f8 mesh dispatch
 ];
 /// The rest of [`METHODS`], kept apart only to stay readable.
-const MORE_METHODS: [(usize, *const ()); 9] = [
+const MORE_METHODS: [(usize, *const ()); 11] = [
+    (53, clear_uav_uint as *const ()),         // 0x1a8
+    (54, clear_uav_float as *const ()),        // 0x1b0
     (28, query_mark as *const ()),             // 0xe0 BeginQuery
     (29, query_mark as *const ()),             // 0xe8 EndQuery
     (30, resolve_queries as *const ()),        // 0xf0

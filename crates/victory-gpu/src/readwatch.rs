@@ -133,6 +133,11 @@ fn title_images() -> &'static [(usize, usize, String)] {
     })
 }
 
+/// Whether `rip` lies in one of the title's images (`crate::keep`'s probe).
+pub(crate) fn title_code(rip: usize) -> bool {
+    title_images().iter().any(|&(s, e, _)| rip >= s && rip < e)
+}
+
 /// The handler (first in line) and the thread that logs hits and puts the
 /// guards back, once.
 fn install() {

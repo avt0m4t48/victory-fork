@@ -86,6 +86,10 @@ fn build() -> &'static [u8; 32] {
             "VICTORY_F16_NEAREST",
             "VICTORY_STRICT_JOINS",
             "VICTORY_MESH_OUTPUT_STRICT",
+            // Which first halves of interpolations are evaluated as pairs,
+            // and how a first-lane read of a lane's own value is made.
+            "VICTORY_FIRST_HALF",
+            "VICTORY_FIRSTLANE_OWN",
         ] {
             hash.update(name.as_bytes());
             hash.update(b"=");
