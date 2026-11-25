@@ -666,6 +666,35 @@ impl State {
         crate::draw::depth_bounds(list, min, max);
     }
 
+    /// A pass of ours was recorded into the title's list
+    /// (`HostList::plane_now`): it set a descriptor heap, a graphics root
+    /// signature, a pipeline, a depth target, a viewport, a scissor and the
+    /// topology. What the title set is set again: targets, viewports,
+    /// scissors and topology here; heaps, root signatures and pipeline by
+    /// the next `bind`, told that the list holds none of the title's (heaps
+    /// as no title's set, so the title's go back even if it set none). The
+    /// tables stay: they are in this host list. The pass leaves the blend
+    /// factor, stencil reference and depth bounds alone.
+    fn after_our_pass(&mut self, list: &HostList) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [usize::MAX; 2];
+        if self.topology_set {
+            self.set_topology(list, self.topology);
+        }
+        if self.targets_set {
+            let handles = std::mem::take(&mut self.target_handles);
+            self.set_targets(list, &handles, self.depth_handle);
+        }
+        if !self.viewports.is_empty() {
+            crate::draw::viewports(list, &self.viewports);
+        }
+        if !self.scissors.is_empty() {
+            let rects = std::mem::take(&mut self.scissors);
+            self.set_scissors(list, &rects);
+        }
+    }
+
     /// `list` is a new host list that continues the title's list (it was
     /// cut at a wait for a memory value, `crate::list::cut`): a new host
     /// list has nothing set, so what the title set so far is set again.
@@ -916,6 +945,12 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        // Depth planes this list's shaders wrote (the material classes):
+        // drawn into their planes by a pass of ours before anything of the
+        // title's is set, so what reads them next finds them.
+        if list.planes_now() {
+            self.after_our_pass(list);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);

@@ -4670,6 +4670,53 @@ impl HostList {
         true
     }
 
+    /// Before a draw or dispatch binds anything: every depth texture with a
+    /// stencil plane whose depth plane's twin an earlier draw or dispatch of
+    /// this list wrote (the tiled lighting's compute writes each pixel's
+    /// material class there) gets the stencil twin copied and the depth
+    /// plane's twin drawn into the plane now, not when the list closes.
+    /// That shortcut of `twin_use` left the shaders that read the classes
+    /// back in the same list (as a texture: run pn1 saw no such depth
+    /// target) with the classes of the frame before, about once a frame.
+    /// Done for whatever comes next, also a dispatch that writes the twin
+    /// again (a pass more, never a wrong one): which textures a draw reads
+    /// is known only while its tables are made, after its pipeline is set.
+    /// True if a pass was recorded: it set a descriptor heap, graphics root
+    /// signature, pipeline, depth target, viewport, scissor and topology of
+    /// its own, and the caller sets the title's again
+    /// (`State::after_our_pass`). `VICTORY_PLANE_NOW=0` keeps the old way.
+    pub(crate) fn planes_now(&self) -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        if !*ON.get_or_init(|| std::env::var_os("VICTORY_PLANE_NOW").is_none_or(|v| v != "0")) {
+            return false;
+        }
+        let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
+        if twins.is_empty() {
+            return false;
+        }
+        let due: Vec<_> = twins
+            .values_mut()
+            .filter(|u| u.behind[0] == Some(true) && u.twin.plane.is_some())
+            .map(|u| {
+                u.behind[0] = Some(false);
+                u.late = false;
+                (u.depth.clone(), u.twin.clone())
+            })
+            .collect();
+        drop(twins);
+        for (depth, twin) in &due {
+            self.twin_copy(depth, twin, false);
+            self.pass_plane(depth, twin);
+        }
+        if !due.is_empty() {
+            static SAID: std::sync::Once = std::sync::Once::new();
+            SAID.call_once(|| {
+                tracing::info!("depth planes written by shaders are drawn into the plane before the next draw or dispatch, not when the list closes (VICTORY_PLANE_NOW=0: as before)");
+            });
+        }
+        !due.is_empty()
+    }
+
     /// Records the pass that draws the twin of the depth plane of `depth`
     /// into the plane, if `twin` has one, with the moves to the states the
     /// pass needs; the twin is left in the unordered access state. Only
