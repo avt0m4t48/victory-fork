@@ -574,6 +574,163 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod direct_fence_probe {
+    use super::*;
+
+    pub(super) const MODE: &str = "VICTORY_TEST_DIRECT_FENCE_CHILD";
+
+    #[test]
+    fn synchronous_submit_checks_fence_waits_before_publishing_completion() {
+        if let Ok(mode) = std::env::var(MODE) {
+            on_failure(|message| {
+                assert_eq!(FINISHED.load(Ordering::Acquire), 0);
+                assert_eq!(STARTED.load(Ordering::Acquire), 1);
+                assert_eq!(unsafe { host().unwrap().fence.GetCompletedValue() }, 0);
+                eprintln!("reported direct fence failure before completion: {message}");
+                std::process::exit(42);
+            });
+            let host = host().expect("WARP device in the child process");
+            let first = host.new_list().unwrap();
+            let second = host.new_list().unwrap();
+            first.close();
+            second.close();
+            if mode.starts_with("healthy") {
+                host.execute(&[&first, &second]);
+                let expected = if mode == "healthy-grouped" { 2 } else { 1 };
+                assert_eq!(*host.submitted.lock().unwrap(), expected);
+                assert_eq!(unsafe { host.fence.GetCompletedValue() }, expected);
+                assert_eq!(FINISHED.load(Ordering::Acquire), 1);
+                eprintln!("published healthy completion after {expected} direct fence signals");
+                return;
+            }
+
+            // SAFETY: the unsignalled fence gates only this isolated queue.
+            let gate: ID3D12Fence =
+                unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+            host.execute(&[&first]);
+            panic!("submission returned despite injected {mode} failure");
+        }
+
+        let name = "host::direct_fence_probe::synchronous_submit_checks_fence_waits_before_publishing_completion";
+        for (mode, code, marker) in [
+            ("signal", 42, "could not signal a synchronous host submission"),
+            ("registration", 42, "could not register a direct fence wait for a synchronous host submission"),
+            ("wait", 42, "could not wait for a synchronous host submission"),
+            ("healthy", 0, "published healthy completion after 1 direct fence signals"),
+            ("healthy-grouped", 0, "published healthy completion after 2 direct fence signals"),
+        ] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child.args(["--exact", name, "--nocapture"])
+                .env(MODE, mode)
+                .env("VICTORY_D3D12_WARP", "1")
+                .env("VICTORY_LATE_WAIT", "0")
+                .env_remove("VICTORY_GPU_TIMING");
+            if mode == "healthy-grouped" {
+                child.env("VICTORY_GPU_TIMING", "1");
+            }
+            let output = child.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(output.status.code(), Some(code), "{mode}: {stderr}");
+            assert!(stderr.contains(marker), "{mode}: {stderr}");
+            if mode == "wait" {
+                assert!(stderr.contains("0x80070006"), "missing ERROR_INVALID_HANDLE: {stderr}");
+            }
+            eprintln!("{mode}: {stderr}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "diagnostics"))]
+mod late_fence_probe {
+    use super::*;
+
+    pub(super) const MODE: &str = "VICTORY_TEST_LATE_FENCE_CHILD";
+    static BOTTOM_WRITE: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn waits_for_a_flight_before_its_bottom_of_pipe_write() {
+        if let Ok(mode) = std::env::var(MODE) {
+            use crate::queue::Written;
+            assert!(late() && !relay());
+            on_failure(|message| {
+                assert_eq!(BOTTOM_WRITE.load(Ordering::Acquire), 0);
+                assert_eq!(FINISHED.load(Ordering::Acquire), 0);
+                assert_eq!(unsafe { host().unwrap().fence.GetCompletedValue() }, 0);
+                eprintln!("reported late-fence failure before landing: {message}");
+                std::process::exit(42);
+            });
+            let host = host().expect("isolated WARP device");
+            let list = host.new_list().unwrap();
+            list.defer_write(BOTTOM_WRITE.as_ptr().cast(), Written::Value(0x1234), 4);
+            list.close();
+            let gate: ID3D12Fence =
+                unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+            let (mut submitted, sent) = host.submit(&[&list], true).unwrap();
+            assert_eq!(*submitted, 1);
+            assert_eq!(unsafe { host.fence.GetCompletedValue() }, 0);
+            {
+                // Use the same flight layout as execute_own, without
+                // starting a second observer of the queued flight.
+                let mut queue = line();
+                queue.target = *submitted;
+                queue.lists = 1;
+                queue.line.push(Late::Run(Flight {
+                    number: sent.number,
+                    fence: *submitted,
+                    lists: Vec::new(),
+                    order: Vec::new(),
+                    card: sent.card,
+                    back: sent.back,
+                }));
+                queue.line.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            }
+            if mode == "healthy" {
+                unsafe { gate.Signal(1) }.unwrap();
+                host.settle(&mut submitted, WHY_SYNC);
+                assert_eq!(unsafe { host.fence.GetCompletedValue() }, 1);
+                assert_eq!(BOTTOM_WRITE.load(Ordering::Acquire), 0x1234);
+                assert_eq!(FINISHED.load(Ordering::Acquire), sent.number);
+                eprintln!("landed the late write after fence 1 completed");
+                return;
+            }
+            host.settle(&mut submitted, WHY_SYNC);
+            assert_eq!(unsafe { host.fence.GetCompletedValue() }, 0);
+            assert_eq!(BOTTOM_WRITE.load(Ordering::Acquire), 0x1234);
+            assert_eq!(FINISHED.load(Ordering::Acquire), sent.number);
+            eprintln!("landed the late write and published completion with fence 0 below 1");
+            unsafe {
+                gate.Signal(1).unwrap();
+                host.fence.SetEventOnCompletion(*submitted, HANDLE::default()).unwrap();
+            }
+            std::process::exit(0);
+        }
+        let mode = std::env::var("VICTORY_TEST_LATE_FENCE_MODE").unwrap_or_else(|_| "registration".into());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host::late_fence_probe::waits_for_a_flight_before_its_bottom_of_pipe_write", "--nocapture"])
+            .env(MODE, &mode)
+            .env("VICTORY_D3D12_WARP", "1")
+            .env("VICTORY_LATE_WAIT", "1")
+            .env("VICTORY_RELAY", "0")
+            .env_remove("VICTORY_GPU_TIMING")
+            .output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if mode == "healthy" {
+            assert_eq!(output.status.code(), Some(0), "{stderr}");
+            assert!(stderr.contains("landed the late write after fence 1 completed"), "{stderr}");
+        } else {
+            assert_eq!(output.status.code(), Some(42), "{stderr}");
+            assert!(stderr.contains("reported late-fence failure before landing"), "{stderr}");
+            if mode == "wait" {
+                assert!(stderr.contains("0x80070006"), "{stderr}");
+            }
+        }
+        eprint!("{stderr}");
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -5145,11 +5302,30 @@ impl Host {
         // SAFETY: the fence and event are ours, and the submission lock
         // prevents another wait from using this event.
         unsafe {
-            if let Err(e) = self.fence.SetEventOnCompletion(target, self.event) {
+            #[cfg(all(test, feature = "diagnostics"))]
+            let fault = std::env::var(if context == "submissions sent ahead" {
+                late_fence_probe::MODE
+            } else {
+                direct_fence_probe::MODE
+            }).unwrap_or_default();
+            #[cfg(not(all(test, feature = "diagnostics")))]
+            let fault = "";
+            let registered = if fault == "registration" {
+                Err(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+            } else {
+                self.fence.SetEventOnCompletion(target, self.event)
+            };
+            if let Err(e) = registered {
                 fail(format_args!("could not register a direct fence wait for {context} ({e})"));
             }
             working(false);
-            match WaitForSingleObject(self.event, INFINITE) {
+            let waited = if fault == "wait" {
+                windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_INVALID_HANDLE);
+                WAIT_FAILED
+            } else {
+                WaitForSingleObject(self.event, INFINITE)
+            };
+            match waited {
                 WAIT_OBJECT_0 => {}
                 WAIT_FAILED => {
                     let error = windows::core::Error::from_thread();
@@ -5486,7 +5662,16 @@ impl Host {
             unsafe {
                 self.queue.ExecuteCommandLists(group);
                 self.card_sent();
-                if let Err(e) = self.queue.Signal(&self.fence, *submitted) {
+                #[cfg(all(test, feature = "diagnostics"))]
+                let bad_signal = std::env::var(direct_fence_probe::MODE).as_deref() == Ok("signal");
+                #[cfg(not(all(test, feature = "diagnostics")))]
+                let bad_signal = false;
+                let signal = if bad_signal {
+                    Err(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+                } else {
+                    self.queue.Signal(&self.fence, *submitted)
+                };
+                if let Err(e) = signal {
                     fail(format_args!("could not signal a synchronous host submission ({e})"));
                 }
             }
