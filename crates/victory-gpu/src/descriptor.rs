@@ -1210,6 +1210,59 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn a_fresh_half_table_includes_the_last_descriptor_the_shader_reads() {
+        use victory_shader::{ResourceType, RootType, UsedResource};
+
+        let device = crate::host::host().expect("a WARP device for the probe");
+        let list = device.new_list().unwrap();
+        let desc = HeapDesc { kind: VIEWS_KIND, count: 2, flags: SHADER_VISIBLE, nodes: 1 };
+        let placement = Placement { address: 0, size: 0 };
+        let mut h = std::ptr::null();
+        assert_eq!(create(desc, placement, &mut h), S_OK);
+        let title_heap = heap(h);
+        let host_heap = title_heap.host().expect("a host view heap");
+        let first = title_heap.handle(0).unwrap();
+        let last = title_heap.handle(1).unwrap();
+        let data = [0u64; 64];
+        let address = data.as_ptr() as u64;
+        let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let mut view_desc = [0; 16];
+        view_desc[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]); // RGBA16_FLOAT
+        view_desc[10] = address as u32;
+        view_desc[11] = (address >> 32) as u32;
+        create_placed_srv(std::ptr::null(), &resource, &view_desc, last);
+        assert!(view(last).as_ref().and_then(host::half_view).is_some());
+
+        // The metadata has one range at dword 0. The shader loads the second
+        // descriptor of that range and therefore needs two dynamic slots.
+        let mut state = crate::draw::State::default();
+        state.set_heaps(&[h]);
+        state.set_table(true, 1, first);
+        let range = UsedResource {
+            kind: ResourceType::Srv,
+            root: RootType::Table,
+            table_offset_dwords: 0,
+            lower_bound: 0,
+            stride: 8,
+            dwords: 4,
+            user_data: 4,
+            slot: 1,
+        };
+        let tables = state.tables(&list, &[range], &[], &[(1, 8)], true);
+        let [(1, base)] = tables.as_slice() else {
+            panic!("expected a fresh table at slot 1, got {tables:?}");
+        };
+        assert_ne!(*base, u32::MAX);
+        let base = base / 32;
+        let next = host_heap.dynamic(1).unwrap();
+        host_heap.release(next, 1);
+        drop(state);
+        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+        assert_eq!(next, base + 2, "an unrelated allocation overlaps the shader's second slot");
+    }
+
     #[test]
     fn heaps_hold_count_descriptors_from_their_start() {
         let null = std::ptr::null();
