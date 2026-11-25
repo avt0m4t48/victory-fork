@@ -1,0 +1,29 @@
+name: Frame wait and clock regressions on Windows
+on:
+  push:
+    branches: [verify/frame-waits-clock]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 13
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm exact patch
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '62f69b6be9a1705e64e5f11480c86159692fe78a') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-frame-waits-clock.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify the frame clock and title wait calls
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib frame::tests -- --test-threads=1
+      - name: Verify the legacy late-wait switch
+        env:
+          VICTORY_LATE_WAITS: '1'
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib frame::tests -- --test-threads=1
+      - run: cargo run --locked --quiet --package xtask -- policy
