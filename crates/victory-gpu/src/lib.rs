@@ -57,6 +57,8 @@ mod texture;
 mod watch;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod readwatch;
+#[cfg(windows)]
+mod texback;
 
 #[cfg(windows)]
 pub use host::on_failure;
