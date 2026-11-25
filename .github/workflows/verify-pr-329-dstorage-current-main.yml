@@ -1,0 +1,28 @@
+name: DirectStorage retry diagnostics and physical destinations
+on:
+  push:
+    branches: [verify/pr-329-dstorage-current-main]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm exact PR source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '2014383c36efe2a094749c2dd7b0b243ac0b1a1a') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-pr-329-dstorage-current-main.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Run DirectStorage and physical memory tests
+        shell: pwsh
+        run: |
+          cargo test --locked -p victory-hle --lib modules::dstorage::tests -- --test-threads=1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked -p victory-hle --lib modules::xmem::tests -- --test-threads=1
