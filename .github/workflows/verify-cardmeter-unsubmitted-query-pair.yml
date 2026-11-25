@@ -1,0 +1,37 @@
+name: Timestamp ownership for a closed unsubmitted list
+on:
+  push:
+    branches: [verify/cardmeter-unsubmitted-query-pair]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_CARD_METER: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm baseline and probe
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne '0b0074e0b2765e574c622e9a3de566f20f04135b') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-gpu/src/cardmeter.rs') { throw 'Unexpected probe changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Exercise the ring cursor after ageing a closed list
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib a_closed_unsubmitted_list_keeps_its_timestamp_pair -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output -join ' '
+          if ($code -ne 101 -or $log -notmatch 'panicked at' -or $log -notmatch "a newer list must not reuse an unsubmitted list's query pair") {
+            throw 'The baseline did not fail at the reservation assertion'
+          }
+          Write-Output 'Confirmed pair reuse while the old recorded list remains live'
+          exit 0
