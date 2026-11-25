@@ -1,0 +1,38 @@
+name: Reproduce premature direct-fence completion on WARP
+on:
+  push:
+    branches: [verify/sync-direct-fence-errors-red]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 16
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm source and isolated failure probe
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne '0b0074e0b2765e574c622e9a3de566f20f04135b') { throw 'Unexpected baseline' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-gpu/src/host.rs') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Inject an event registration error and a Win32 wait failure
+        shell: pwsh
+        run: |
+          $ErrorActionPreference='Continue'
+          foreach ($mode in @('registration','wait')) {
+            $env:VICTORY_TEST_DIRECT_FENCE_MODE=$mode
+            $output = & cargo test --locked -p victory-gpu --features diagnostics --lib synchronous_submit_stops_when_the_fence_wait_fails -- --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Output $_ }
+            $log = $output | Out-String
+            if ($code -ne 101 -or $log -notmatch 'panicked at' -or $log -notmatch 'marked direct work finished with fence 0 below 1') {
+              throw "Expected premature completion in the $mode test, code $code"
+            }
+            Write-Output "Confirmed premature completion after injected $mode failure"
+          }
+          exit 0
