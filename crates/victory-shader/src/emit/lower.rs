@@ -2459,8 +2459,8 @@ impl<'a> Lower<'a> {
         let id = self
             .s
             .op(entry, name, Attr::ReadNone, self.s.t.i32, opcode, &[component]);
-        // Only `x` is split; `y` and `z` are the console's.
-        if c != 0 || !group_split_on() {
+        // Only the workgroup's X coordinate (DXIL groupId, opcode 94) is rebased.
+        if opcode != 94 || c != 0 || !group_split_on() {
             return Val::I32(id);
         }
         let base = self.host_word(RootType::Other(USER_GROUP_BASE), 0, 0);
