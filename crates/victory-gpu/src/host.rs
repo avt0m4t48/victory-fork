@@ -208,18 +208,20 @@ fn sweep() {
 /// if none is.
 pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
-    if started <= FINISHED.load(Ordering::Acquire) {
-        RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
-        return;
+    if started > FINISHED.load(Ordering::Acquire) {
+        #[cfg(test)]
+        retirement_race_probe::pause_before_queueing();
+        let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+        // Completion publishes FINISHED before taking this lock to drain
+        // the queue. Recheck in case it already drained this submission.
+        if started > FINISHED.load(Ordering::Acquire) {
+            RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
+            retired.push((started, Retired(Box::new(object))));
+            return;
+        }
     }
-    #[cfg(test)]
-    retirement_race_probe::pause_before_queueing();
-    RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
-    RETIRED
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .push((started, Retired(Box::new(object))));
+    RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
+    drop(object);
 }
 
 #[cfg(test)]
