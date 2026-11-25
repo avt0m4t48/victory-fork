@@ -31,12 +31,33 @@ What vx-layer adds on top of the fork's commit 4e17478:
   own `VICTORY_LATE_WAIT=3 VICTORY_WIDE_BACK=1 VICTORY_CARD_BUFFERS_MIN_MB=1
   VICTORY_CARD_BUFFERS_MB=2048`. On an RTX 4090 the title's opening cutscene
   went from 0.5–3 s per frame to 0.28–0.44 s, with no device loss.
+- **Lighting on 32-lane GPUs** (`VICTORY_WAVE_WIDE_ONLY=<hash>,...`): a console
+  wave64 compute program that keeps `WaveSize(64)` is refused by NVIDIA's runtime
+  (32-lane waves only) and its dispatches are dropped every frame. This switch
+  lets the listed programs take the fork's wave-wide form (lane-divergent
+  branches taken by the whole wave, two group barriers each) instead of the
+  global `VICTORY_WAVE_WIDE=1`, which once lost the device on particle programs.
+  With `369cbe906ea72764,2cc4c197ee29e291` (the title's visibility and tiled
+  light-list passes) characters and rooms are lit in colour instead of showing
+  as dark silhouettes; 7-minute gameplay runs, no errors. The card does the real
+  lighting work now, so frames are slower (about 430 ms against 350 at 4-7k
+  draws). `examples/wave_check` translates saved shaders offline as for a
+  32-lane host and prints the wave size each would ask for.
+- **Startup flicker** (`VICTORY_TEXTURE_HOT=1`): a texture the title rewrites
+  through another mapping was re-hashed only every eighth frame, so a loading
+  video played from three such textures cycled through stale pictures. With the
+  switch, textures whose hash changed in the last 30 frames are hashed every
+  frame: brightness jumps in a 60 s boot recording fell from 64-83 to 13 (the
+  video's real cuts), for about 5-7 ms per frame in gameplay.
 
-Known problems (open): some materials and walls are missing (a few shaders still
-do not translate, and five compute programs need 64-lane waves that NVIDIA does
-not offer), many surfaces show little texture detail, frames stutter and are
-slow (2-4 fps in gameplay), and the startup screens flicker (stale vertex data
-on alternate frames).
+`tools/vx-play.ps1` sets both switches.
+
+Known problems (open): walls are missing in some views and runs, some faces and
+clothing show blotchy or blocky patches, three compute programs (tiled
+volumetric light and alpha shadow cascades) still do not translate, two wave64
+compute programs with several console waves per thread group are still
+refused, many surfaces show little texture detail, and frames are slow
+(2-3 fps in gameplay).
 
 Build: `cargo build --release -p victory`; run:
 `powershell -ExecutionPolicy Bypass -File tools\vx-play.ps1 -GameExe "<game folder>\<title exe>"`

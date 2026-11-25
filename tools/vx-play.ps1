@@ -7,6 +7,7 @@
 #   ... -Exe <victory.exe>       build to run (default: target\release\victory.exe)
 #   ... -SeriesS                 the Series S profile (its FSR4 upscaler does not run on NVIDIA yet)
 #   ... -NoSpeedSwitches         the fork's defaults instead of the settings below
+#   ... -NoWide                  without VICTORY_WAVE_WIDE_ONLY (faster, but unlit characters and rooms)
 #   ... -Logs <folder>           where stdout/stderr go (default: .\runs)
 #
 # Keyboard is a pad while the window has focus: Enter = A, Backspace = B, W A S D = left stick,
@@ -18,11 +19,18 @@ param(
     [string]$Config = (Join-Path $PSScriptRoot '..\victory.toml'),
     [string]$Logs = (Join-Path (Get-Location) 'runs'),
     [switch]$SeriesS,
-    [switch]$NoSpeedSwitches
+    [switch]$NoSpeedSwitches,
+    [switch]$NoWide
 )
-if (-not (Test-Path $Exe)) { throw "no build at $Exe: cargo build --release -p victory" }
-if (-not (Test-Path $GameExe)) { throw "no title executable at $GameExe" }
+if (-not (Test-Path $Exe)) { throw "no build at ${Exe}: cargo build --release -p victory" }
+if (-not (Test-Path $GameExe)) { throw "no title executable at ${GameExe}" }
 if (Test-Path $Config) { $env:VICTORY_CONFIG = (Resolve-Path $Config).Path }
+# textures the title rewrites through another mapping are hashed every frame while they change (no
+# startup flicker; ~5-7 ms/frame)
+$env:VICTORY_TEXTURE_HOT = '1'
+# the visibility and tiled light-list passes run as 32-lane waves on 32-lane GPUs (NVIDIA); without this
+# they are refused and dropped, and characters and rooms render unlit. Drop with -NoWide for speed.
+if (-not $NoWide) { $env:VICTORY_WAVE_WIDE_ONLY = '369cbe906ea72764,2cc4c197ee29e291' }
 if (-not $NoSpeedSwitches) {
     # texture refreshes read title memory through the kernel instead of waiting for the title's remaps
     $env:VICTORY_TEXTURE_NO_WAIT = '1'
