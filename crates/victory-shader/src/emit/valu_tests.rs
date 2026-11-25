@@ -202,27 +202,37 @@ fn build_cs_with_group_id(body: &[u32], threads: u32, lds_bytes: u32, group_id: 
 #[test]
 fn group_base_rebases_group_x_without_shifting_local_x() {
     let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    let mut words = vec![vop1(0x001, 5, sgpr(6))]; // v5 = group X
-    words.extend(buffer_store_dword(5, 8, 4));
-    let shader = build_cs_with_group_id(&words, 1, 0, true);
+    let words = [
+        vop1(0x001, 5, sgpr(6)),      // v5 = rebased group X
+        vop2(0x26, 6, vgpr(5), 1),   // v6 = group X minus expected base
+        vop2(0x1a, 6, 0x81, 6),     // v6 *= 2
+        vop2(0x25, 6, vgpr(0), 6),   // v6 += local X
+        vop2(0x1a, 6, 0x83, 6),     // byte offset of pair
+        0xE070_1004, 0x8002_0506,    // store group X at v6 + 4
+        0xE070_1008, 0x8002_0006,    // store local X at v6 + 8
+        vop1(0x001, 0, 0x80),        // the fixture stores zero in the reserved first dword
+    ];
+    let shader = build_cs_with_group_id(&words, 2, 0, true);
     let group_root = RootType::Other(super::USER_GROUP_BASE);
     let group_base = shader.user_data.iter().find(|u| u.root == group_root).unwrap().index;
     let host = Host::new(true).expect("WARP device");
     let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
     for base in [0, 65_535] {
         let mut words = vec![0; shader.user_data_dwords().max(1) as usize];
+        words[0] = base;
         words[group_base as usize] = base;
         let output = host.dispatch(
             &root,
             &pso,
             &Dispatch {
                 roots: vec![(0, Root::Constants(words))],
-                views: &[View::RawUav(2)],
+                views: &[View::RawUav(9)],
                 samplers: &[],
-                groups: [1, 1, 1],
+                groups: [2, 1, 1],
             },
         ).unwrap();
-        assert_eq!(output[0], [0, base], "group base must leave the local ID alone");
+        assert_eq!(output[0], [0, base, 0, base, 1, base + 1, 0, base + 1, 1]);
+        println!("WARP group base {base}, readback {:?}", output[0]);
     }
 
     let local_only = build_valu_cs(&[]);

@@ -1,39 +1,28 @@
 name: Direct compute group count on Windows WARP
 on:
   push:
-    branches: [verify/direct-compute-count-c5620e2-173113]
+    branches: [verify/integrated-dispatch-2e02245]
 permissions:
   contents: read
 jobs:
   warp:
     runs-on: windows-2025
     timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: candidate
-            source: c5620e2a648a10db76e1255ee556c06001f4c313
-            enabled: '65537'
-          - name: parent
-            source: 1ae3e333b686547137dc7320b267e7093d886f3d
-            enabled: '65535'
-    name: WARP / ${{ matrix.name }}
     env:
       VICTORY_D3D12_WARP: '1'
     steps:
       - uses: actions/checkout@v5
         with:
           persist-credentials: false
-          fetch-depth: 4
+          fetch-depth: 8
       - name: Apply only the test fixture to the exact source commit
         shell: pwsh
         run: |
           $fixture = Join-Path $env:RUNNER_TEMP direct-compute-fixture.patch
-          git diff --binary --output="$fixture" HEAD~2 HEAD^
+          git diff --binary --output="$fixture" 2e02245 HEAD -- crates
           if ($LASTEXITCODE) { throw 'Fixture export failed' }
-          git checkout --detach ${{ matrix.source }}
-          if ($LASTEXITCODE -or (git rev-parse HEAD) -ne '${{ matrix.source }}') { throw 'Wrong source commit' }
+          git checkout --detach 2e02245
+          if ($LASTEXITCODE -or (git rev-parse --short=7 HEAD) -ne '2e02245') { throw 'Wrong source commit' }
           git apply --check "$fixture"
           if ($LASTEXITCODE) { throw 'Fixture does not apply' }
           git apply "$fixture"
@@ -44,10 +33,16 @@ jobs:
       - name: Split enabled
         env:
           VICTORY_GROUP_SPLIT: '1'
-          EXPECTED_DIRECT_GROUPS: ${{ matrix.enabled }}
+          EXPECTED_DIRECT_GROUPS: '65537'
         run: cargo test --locked -p victory-gpu --features diagnostics --lib pipeline::tests::warp_direct_compute_group_count_without_group_x -- --exact --nocapture
       - name: Split disabled control
         env:
           VICTORY_GROUP_SPLIT: '0'
           EXPECTED_DIRECT_GROUPS: '65535'
         run: cargo test --locked -p victory-gpu --features diagnostics --lib pipeline::tests::warp_direct_compute_group_count_without_group_x -- --exact --nocapture
+      - name: Group X and local X through translated DXIL
+        env:
+          VICTORY_GROUP_SPLIT: '1'
+        run: cargo test --locked -p victory-shader --lib emit::valu_tests::group_base_rebases_group_x_without_shifting_local_x -- --exact --nocapture
+      - name: Shader metadata
+        run: cargo test --locked -p victory-shader --lib a_program_that_reads_its_group_id_gets_the_group_base -- --nocapture
