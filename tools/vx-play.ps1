@@ -10,6 +10,7 @@
 #   ... -NoWide                  without VICTORY_WAVE_WIDE_ONLY (faster, but unlit characters and rooms)
 #   ... -NoOverlay               without the status bar (tools\vx-overlay.py, needs Python 3 with Tk) that sits on
 #                                the game window's bottom edge and says WORKING (not frozen) when frames stall
+#   ... -NoDepthBounds           the depth bounds test off (VICTORY_DEPTH_BOUNDS=0), to compare scenes
 #   ... -Logs <folder>           where stdout/stderr go (default: .\runs)
 #
 # Keyboard is a pad while the window has focus: Enter = A, Backspace = B, W A S D = left stick,
@@ -23,7 +24,8 @@ param(
     [switch]$SeriesS,
     [switch]$NoSpeedSwitches,
     [switch]$NoWide,
-    [switch]$NoOverlay
+    [switch]$NoOverlay,
+    [switch]$NoDepthBounds
 )
 if (-not (Test-Path $Exe)) { throw "no build at ${Exe}: cargo build --release -p victory" }
 if (-not (Test-Path $GameExe)) { throw "no title executable at ${GameExe}" }
@@ -43,12 +45,10 @@ if (-not $NoSpeedSwitches) {
     $env:VICTORY_PIPELINE_WAIT_MS = '24'
     # small pipelines first; big compute programs on fewer workers (vx-layer)
     $env:VICTORY_PIPELINE_SMALL_FIRST = '1'
-    # the fork's own submission and card-buffer speed-ups
-    $env:VICTORY_LATE_WAIT = '3'
-    $env:VICTORY_WIDE_BACK = '1'
-    $env:VICTORY_CARD_BUFFERS_MIN_MB = '1'
-    $env:VICTORY_CARD_BUFFERS_MB = '2048'
+    # (the copy-back relay, wide copy-back and card copies are the build's own defaults now)
 }
+# the depth bounds test off, to compare (see README: doors and indoor lighting)
+if ($NoDepthBounds) { $env:VICTORY_DEPTH_BOUNDS = '0' } else { Remove-Item Env:VICTORY_DEPTH_BOUNDS -ErrorAction SilentlyContinue }
 New-Item -ItemType Directory -Force $Logs | Out-Null
 $tag = 'play-' + (Get-Date -Format 'yyyyMMdd-HHmmss')
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }

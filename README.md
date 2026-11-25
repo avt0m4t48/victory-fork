@@ -86,11 +86,31 @@ What vx-layer adds on top of the fork's commit 4e17478:
   are `VICTORY_TEXTURE_STAGE_MB/_MS` there; `VICTORY_HEAP_TEXTURE_MB/_MS` still
   work here.
 
-Measured on an RTX 4090 with all of the above: about 385 ms per frame at
-4,000-7,000 draws (2.6 fps), seven-minute runs without errors.
+- **Textures that stream in later are uploaded again.** A DirectStorage
+  destination in physical pages is written through a view of our own, so the
+  title's addresses that show those pages saw no write, and a texture placed
+  there was looked at again only if a sampled check caught the change (over
+  1,000 such textures found in one run; pieces of others stayed stale: blocky
+  patches on clothing). The memory module now keeps, for each section page, the
+  title addresses showing it, and tells each range once the bytes have landed;
+  an address destination is told again after its bytes land too. Past 32,768
+  noted ranges between two texture passes the list was cleared, losing every
+  notice in it; ranges are now joined across growing gaps instead.
+- Merged from fxceless/victory-fork (c96b4f2): the depth bounds test (#82),
+  faster defaults (the copy-back relay, wide copy-back, card copies from 1 MiB,
+  256 lists in the air), textures on the card before the characters' decoration
+  bake, one host copy per placed texture. `tools/vx-play.ps1` no longer sets the
+  older speed switches, so these defaults apply. `VICTORY_DEPTH_BOUNDS=0`
+  (`-NoDepthBounds`) leaves the depth bounds test off: in one run with it, doors
+  were missing and characters indoors were dark; in one without it, a later room
+  was dark and some props were missing. Not settled yet.
 
-Known problems (open): walls are missing in some views and runs; some clothing
-shows blocky patches; one compute program (alpha shadow cascades) still does
+Measured on an RTX 4090 with all of the above: about 318 ms per frame at
+4,000-7,000 draws (3.1 fps), seven-minute runs without errors.
+
+Known problems (open): walls, doors or props are missing in some views and runs;
+characters are dark and glossy in some rooms; some clothing shows blocky
+patches; one compute program (alpha shadow cascades) still does
 not translate; four wave64 compute programs are refused by NVIDIA's 32-lane
 limit (the tiled volumetric light pair, which translate since the merge, and
 two with several console waves per thread group); scene changes still stall for one to three
