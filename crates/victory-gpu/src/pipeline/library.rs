@@ -483,7 +483,14 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
     }
     // The rejected bytes are let go (a mapped file is unmapped) before the
     // empty library is made: nothing reads them any more.
+    let refused = !blob.bytes().is_empty();
     drop(blob);
+    if refused
+        && may_save()
+        && let Some(dir) = DIR.get()
+    {
+        set_aside(dir);
+    }
     let library = make(&[]).ok()?;
     Some(Library {
         library,
@@ -566,6 +573,9 @@ pub(crate) fn pipeline(
 pub(crate) fn save(now: bool) {
     static LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
     const SAVE_EVERY: std::time::Duration = std::time::Duration::from_secs(20);
+    if !may_save() {
+        return;
+    }
     let (Some(dir), Some(library)) = (DIR.get(), library()) else { return };
     {
         let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
@@ -665,6 +675,47 @@ fn serialise(library: &ID3D12PipelineLibrary1, tmp: &std::path::Path, size: usiz
 /// is left beside it as [`NEXT_FILE`] for the next start.
 fn replace_library(dir: &std::path::Path, tmp: &std::path::Path) -> std::io::Result<()> {
     std::fs::rename(tmp, dir.join(LIBRARY_FILE)).or_else(|_| std::fs::rename(tmp, dir.join(NEXT_FILE)))
+}
+
+/// Whether this run may write the library: not under RenderDoc, nor with
+/// `VICTORY_LIBRARY_SAVE=0`. RenderDoc stands in a library of its own that
+/// refuses the file on disk ("created for a different version") and keeps
+/// no pipelines: its save, 32 bytes, was renamed over a library of 355 MB
+/// (run ch-rdc1), and the next run compiled 1,440 pipelines afresh, with
+/// frames of up to 1.8 s while the world loaded (run vg22).
+fn may_save() -> bool {
+    static MAY: OnceLock<bool> = OnceLock::new();
+    *MAY.get_or_init(|| {
+        if std::env::var_os("VICTORY_LIBRARY_SAVE").is_some_and(|v| v == "0") {
+            tracing::info!("VICTORY_LIBRARY_SAVE=0: the host pipeline library is not saved");
+            return false;
+        }
+        // SAFETY: a lookup of a loaded module by name.
+        let renderdoc = unsafe {
+            windows::Win32::System::LibraryLoader::GetModuleHandleW(windows::core::w!("renderdoc.dll"))
+        };
+        if renderdoc.is_ok() {
+            tracing::info!("under RenderDoc: the host pipeline library is not saved (its stand-in keeps no pipelines)");
+            return false;
+        }
+        true
+    })
+}
+
+/// A library file the host refused is renamed to this before an empty
+/// library takes its place, unless a larger refused one is there already:
+/// a refusal for a reason that passes (RenderDoc, before [`may_save`] knew
+/// it) then costs nothing but renaming it back.
+const REFUSED_FILE: &str = "host-pipelines.refused";
+
+/// Sets the refused library file in `dir` aside ([`REFUSED_FILE`]).
+fn set_aside(dir: &std::path::Path) {
+    let path = dir.join(LIBRARY_FILE);
+    let aside = dir.join(REFUSED_FILE);
+    let len = |p: &std::path::Path| std::fs::metadata(p).map_or(0, |m| m.len());
+    if len(&path) > len(&aside) && std::fs::rename(&path, &aside).is_ok() {
+        tracing::info!(bytes = len(&aside), "the refused host pipeline library was set aside as {REFUSED_FILE}");
+    }
 }
 
 /// Writes `bytes` to a temporary file beside `path`, then renames it over

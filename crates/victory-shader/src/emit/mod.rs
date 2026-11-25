@@ -121,6 +121,14 @@ pub use shader::{
 /// The loop limit without an override: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
+/// What the host told the translator about itself: its largest wave
+/// ([`set_host_max_wave`]) and the null slot that ends its view heap
+/// ([`set_view_heap_limit`], 0: none). Both shape translations, so a cache
+/// of translations must key on them (`victory-gpu`'s does).
+pub fn host_settings() -> [u32; 2] {
+    [lower::host_max_wave(), shader::view_heap_limit()]
+}
+
 /// The iteration count after which a translated loop is left, per lane and
 /// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
 ///

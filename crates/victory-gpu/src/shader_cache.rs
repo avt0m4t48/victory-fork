@@ -1,7 +1,8 @@
 //! Translated shaders kept on disk (decision 0003): under the configured
-//! cache folder, keyed by the container's content and by the VIctory build
-//! that translated it (the BLAKE3 of our executable), so a rebuilt
-//! translator never serves an old translation. Entries go through
+//! cache folder, keyed by the container's content and by the translator
+//! that translated it (a fingerprint of its sources, `build.rs`), so a
+//! rebuilt translator never serves an old translation, and a rebuild that
+//! left the translator alone keeps the cache. Entries go through
 //! `victory-pipeline`'s content-addressed cache, which writes them
 //! atomically; an entry that does not read back is translated again.
 //!
@@ -37,13 +38,34 @@ pub(crate) fn counts() -> (u64, u64) {
     (HITS.load(Ordering::Relaxed), MISSES.load(Ordering::Relaxed))
 }
 
-/// What identifies this build: the BLAKE3 of our executable file and of
+/// What identifies this build's translations: the translator's fingerprint
+/// (`build.rs`: its sources, this file, the lock file, the compiler and the
+/// build's features), what the host told the translator about itself, and
 /// the translation settings it runs with (the loop limit, which a
-/// diagnostics build can change at run time).
+/// diagnostics build can change at run time). With
+/// `VICTORY_SHADER_CACHE_KEY=exe` the executable's own bytes stand in for
+/// the fingerprint, as before: every rebuild then starts cold.
 fn build() -> &'static [u8; 32] {
     static BUILD: OnceLock<[u8; 32]> = OnceLock::new();
     BUILD.get_or_init(|| {
-        let exe = std::env::current_exe().and_then(std::fs::read);
+        let by_exe = std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe");
+        tracing::info!(
+            fingerprint = env!("VICTORY_TRANSLATOR_FINGERPRINT"),
+            host = ?victory_shader::emit::host_settings(),
+            by_exe,
+            "shader cache: translations keyed by the translator's fingerprint"
+        );
+        let exe = if by_exe {
+            std::env::current_exe().and_then(std::fs::read)
+        } else {
+            Ok(env!("VICTORY_TRANSLATOR_FINGERPRINT").as_bytes().to_vec())
+        }
+        .map(|mut bytes| {
+            for setting in victory_shader::emit::host_settings() {
+                bytes.extend_from_slice(&setting.to_le_bytes());
+            }
+            bytes
+        });
         let limit = victory_shader::emit::loop_limit();
         if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
             tracing::warn!(
