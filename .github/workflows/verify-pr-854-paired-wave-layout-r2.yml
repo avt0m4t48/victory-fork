@@ -1,0 +1,28 @@
+name: Paired groups and WARP wave-width capability
+on:
+  push:
+    branches: [verify/pr-854-paired-wave-layout-r2]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 14
+    env:
+      VICTORY_WARP: '1'
+      VICTORY_D3D12_DEBUG: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm the exact branch and test-only additions
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne '0751197e744c92d392a65d02fe40973f566843e2') { throw 'Unexpected PR source' }
+          $files = git diff --name-only HEAD~2 HEAD~1
+          if (Compare-Object @('crates/victory-shader/src/emit/host.rs','crates/victory-shader/src/emit/wave64_tests.rs') $files) { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate both layouts and read back when WARP supports 32 lanes
+        run: cargo test --locked -p victory-shader --lib paired_wave_readback_preserves_three_dimensional_thread_ids -- --nocapture --test-threads=1
