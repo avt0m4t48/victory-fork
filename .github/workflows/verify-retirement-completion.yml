@@ -1,0 +1,41 @@
+name: Retirement completion on Windows WARP
+on:
+  push:
+    branches: [verify/retirement-completion-b82e26f]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        version: [baseline, candidate]
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_LATE_WAIT: '0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 5
+          persist-credentials: false
+      - name: Select and test revision
+        shell: pwsh
+        run: |
+          if ('${{ matrix.version }}' -eq 'baseline') {
+            git checkout --detach 5923f7b761746d52a97d444b91fb82322bac9c0c
+            if ($LASTEXITCODE -ne 0) { throw 'Checkout failed' }
+          }
+          git log -1 --format='%H %s'
+          $test = 'host::retirement_race_probe::retirement_racing_completion_is_dropped_without_a_later_submission'
+          cargo test --locked -p victory-gpu --features diagnostics --lib $test -- --exact --nocapture > warp-test.log 2>&1
+          $code = $LASTEXITCODE
+          Get-Content warp-test.log
+          if ('${{ matrix.version }}' -eq 'baseline') {
+            if ($code -ne 101 -or !(Select-String -Quiet -Path warp-test.log -SimpleMatch "retirement missed the final submission's completion") -or !(Select-String -Quiet -Path warp-test.log -SimpleMatch 'left: 0')) {
+              throw "Unexpected baseline outcome (exit $code)"
+            }
+          } elseif ($code -ne 0 -or !(Select-String -Quiet -Path warp-test.log -SimpleMatch '1 passed; 0 failed') -or !(Select-String -Quiet -Path warp-test.log -SimpleMatch 'normal queued, raced, and idle retirements all dropped exactly once')) {
+            throw "Unexpected candidate outcome (exit $code)"
+          }
