@@ -1,0 +1,61 @@
+name: XGameSave provider output on failure
+on:
+  push:
+    branches: [verify/pr-884-save-init-output]
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 3
+      - name: Confirm the PR source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne 'de1f1f0c43df69a95a5dbd26812816f8374cef04') { throw 'Unexpected PR head' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-hle/src/modules/xgamesave.rs') { throw 'Unexpected probe changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Check the original blocking initializer
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-hle --lib a_failed_blocking_provider_initialization_clears_its_output -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output -join ' '
+          if ($code -ne 101 -or $log -notmatch 'panicked at' -or $log -notmatch 'failure must clear the provider output') {
+            throw 'The original initializer did not fail the provider-output assertion'
+          }
+          Write-Output 'Confirmed the expected provider-output failure'
+          exit 0
+      - name: Clear the output on the failure path and retest
+        shell: pwsh
+        run: |
+          @'
+          from pathlib import Path
+          path = Path("crates/victory-hle/src/modules/xgamesave.rs")
+          source = path.read_text(encoding="utf-8")
+          before = "        Err(hr) => hr,\n    }\n}\nextern \"system\" fn initialize_async("
+          after = """        Err(hr) => {
+                      put(out, std::ptr::null_mut());
+                      hr
+                  }
+              }
+          }
+          extern "system" fn initialize_async("""
+          assert source.count(before) == 1
+          path.write_text(source.replace(before, after), encoding="utf-8")
+          '@ | python -
+          if ($LASTEXITCODE) { throw 'Unable to change the blocking initializer' }
+          foreach ($test in 'a_failed_blocking_provider_initialization_clears_its_output', 'blocking_and_prefix_methods_work') {
+            $output = & cargo test --locked -p victory-hle --lib $test -- --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Output $_ }
+            if ($code -ne 0 -or ($output -join ' ') -notmatch '1 passed; 0 failed; 0 ignored') {
+              throw "The $test regression did not pass with the failure output cleared"
+            }
+          }
