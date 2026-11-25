@@ -832,6 +832,97 @@ mod tests {
     use super::*;
     use crate::object::{S_OK, slot};
 
+    #[cfg(all(windows, feature = "diagnostics"))]
+    #[test]
+    fn warp_direct_compute_group_count_without_group_x() {
+        use crate::host::{compile, host, transition, warp_adapter};
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::core::s;
+
+        const SOURCE: &str = r#"
+RWByteAddressBuffer counter : register(u0);
+[RootSignature("UAV(u0)")]
+[numthreads(1, 1, 1)]
+void main() { counter.InterlockedAdd(0, 1); }
+"#;
+        let expected: u32 = std::env::var("EXPECTED_DIRECT_GROUPS").unwrap().parse().unwrap();
+        let split = std::env::var("VICTORY_GROUP_SPLIT").unwrap();
+        let host = host().expect("host D3D12 device");
+        // SAFETY: read-only adapter queries and creation of a pipeline from the fixture shader.
+        let (root, pso) = unsafe {
+            let actual = host.device.GetAdapterLuid();
+            let warp = warp_adapter().expect("software adapter").GetDesc().unwrap().AdapterLuid;
+            assert_eq!((actual.HighPart, actual.LowPart), (warp.HighPart, warp.LowPart));
+            let bytecode = compile(SOURCE, s!("main"), s!("cs_5_1")).expect("compile counting shader");
+            let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &bytecode).unwrap();
+            let pso = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                pRootSignature: std::mem::transmute_copy(&root),
+                CS: D3D12_SHADER_BYTECODE {
+                    pShaderBytecode: bytecode.as_ptr().cast(),
+                    BytecodeLength: bytecode.len(),
+                },
+                ..Default::default()
+            }).unwrap();
+            (root, pso)
+        };
+        let pipeline = Pipeline {
+            object: Object::new(&FUNCTIONS),
+            packet: [0; 8],
+            shaders: Vec::new(),
+            bound: std::sync::atomic::AtomicBool::new(false),
+            host: Arc::new(make::Pending::for_dispatch_probe(host::HostPipeline {
+                compute: true,
+                mesh: false,
+                pso,
+                root,
+                stages: Vec::new(),
+                slots: 0,
+                inputs: Vec::new(),
+                rects: false,
+                name: "dispatch group-count probe".into(),
+                state: String::new(),
+            })),
+            builder: false,
+        };
+        let this: This = (&raw const pipeline).cast();
+        let mut state = crate::draw::State::default();
+        state.set_pipeline(this);
+        let list = host.new_list().unwrap();
+        let counter = host.uav_buffer(4).unwrap();
+        let (upload, initial) = host.upload_buffer(4).unwrap();
+        let readback = host.read_back_buffer(4).unwrap();
+
+        // Prebind the synthetic root UAV, then enter the actual State::dispatch path.
+        assert!(state.bind(&list, host_pipeline(this).unwrap(), true));
+        // SAFETY: mapped upload memory and an open list with live resources.
+        unsafe {
+            initial.cast::<u32>().write(0);
+            list.list.ResourceBarrier(&[transition(&counter, D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_COPY_DEST)]);
+            list.list.CopyBufferRegion(&counter, 0, &upload, 0, 4);
+            list.list.ResourceBarrier(&[transition(&counter, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)]);
+            list.list.SetComputeRootUnorderedAccessView(0, counter.GetGPUVirtualAddress());
+        }
+        state.dispatch(&list, 65_537, 1, 1);
+        // SAFETY: the transition orders UAV writes before the copy.
+        unsafe {
+            list.list.ResourceBarrier(&[transition(&counter, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            list.list.CopyBufferRegion(&readback, 0, &counter, 0, 4);
+        }
+        list.close();
+        host.execute(&[&list]);
+
+        let mut mapped = std::ptr::null_mut();
+        // SAFETY: synchronous execution has finished and readback holds one u32.
+        let count = unsafe {
+            readback.Map(0, None, Some(&mut mapped)).unwrap();
+            let count = mapped.cast::<u32>().read();
+            readback.Unmap(0, None);
+            count
+        };
+        println!("WARP State::dispatch(65537, 1, 1), VICTORY_GROUP_SPLIT={split}: counted {count}, expected {expected}");
+        assert_eq!(count, expected);
+    }
+
     fn shaders(p: This) -> Vec<(&'static str, Vec<u8>)> {
         pipeline(p)
             .shaders

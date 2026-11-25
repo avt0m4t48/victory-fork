@@ -42,6 +42,14 @@ unsafe impl Send for Pending {}
 unsafe impl Sync for Pending {}
 
 impl Pending {
+    #[cfg(all(test, feature = "diagnostics"))]
+    pub(super) fn for_dispatch_probe(pipeline: HostPipeline) -> Pending {
+        let pending = Self::new(Vec::new(), None);
+        assert!(pending.made.set(Some(pipeline)).is_ok());
+        pending.used.store(true, Ordering::Relaxed);
+        pending
+    }
+
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
         let mut key = blake3::Hasher::new();
         for s in &shaders {
