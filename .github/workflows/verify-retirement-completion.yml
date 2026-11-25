@@ -39,3 +39,4 @@ jobs:
           } elseif ($code -ne 0 -or !(Select-String -Quiet -Path warp-test.log -SimpleMatch '1 passed; 0 failed') -or !(Select-String -Quiet -Path warp-test.log -SimpleMatch 'normal queued, raced, and idle retirements all dropped exactly once')) {
             throw "Unexpected candidate outcome (exit $code)"
           }
+          exit 0
