@@ -1,0 +1,31 @@
+name: Frame log processor-group diagnostics
+on:
+  push:
+    branches: [verify/frame-processor-groups]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm the tested source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '88eb08f6430f74457762f582ff0e921ba71f2a83') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-frame-processor-groups.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the GPU frame log
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib framelog::tests:: -- --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or (Join-String -InputObject $output -Separator ' ') -notmatch 'slow_core_samples_keep_processor_groups_separate.*ok') {
+            throw 'The frame-log regression did not pass'
+          }
