@@ -438,6 +438,10 @@ const EARLY_FILE: &str = "early-pipelines.txt";
 const EARLY_MAX: usize = 8192;
 
 fn library() -> Option<&'static Library> {
+    #[cfg(test)]
+    if std::env::var_os("VICTORY_TEST_LIBRARY_ABSENT").is_some() {
+        return None;
+    }
     static LIBRARY: OnceLock<Option<Library>> = OnceLock::new();
     LIBRARY
         .get_or_init(|| {
@@ -740,6 +744,59 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_keys_persist_across_processes_without_an_application_library() {
+        let phase = std::env::var("VICTORY_TEST_LIBRARY_ABSENT").unwrap();
+        let dir = PathBuf::from(std::env::var_os("VICTORY_TEST_EARLY_DIR").unwrap());
+        use_pipeline_cache(dir.clone());
+        assert!(library().is_none());
+        const FIRST: &str = "synthetic-first-pso";
+        const SECOND: &str = "synthetic-second-pso";
+        let worker_key = |worker| format!("synthetic-worker-{worker}");
+        let listed = || {
+            let text = std::fs::read_to_string(dir.join(EARLY_FILE)).unwrap();
+            text.lines().map(str::to_owned).collect::<HashSet<_>>()
+        };
+        if phase == "write" {
+            let blocked = dir.join(EARLY_FILE).with_extension("tmp");
+            std::fs::create_dir_all(&blocked).unwrap();
+            note_used(FIRST);
+            save(true);
+            assert!(USED_CHANGED.load(Ordering::Relaxed), "an I/O failure leaves the keys dirty");
+            assert!(!dir.join(EARLY_FILE).exists());
+            std::fs::remove_dir(&blocked).unwrap();
+
+            save(true);
+            assert_eq!(listed(), HashSet::from([FIRST.to_owned()]));
+            note_used(SECOND);
+            save(false);
+            assert_eq!(listed(), HashSet::from([FIRST.to_owned()]));
+            assert!(USED_CHANGED.load(Ordering::Relaxed));
+            std::thread::scope(|threads| {
+                for worker in 0..4 {
+                    threads.spawn(move || {
+                        note_used(&worker_key(worker));
+                        save(true);
+                    });
+                }
+            });
+            let expected = [FIRST.to_owned(), SECOND.to_owned()]
+                .into_iter()
+                .chain((0..4).map(worker_key))
+                .collect::<HashSet<_>>();
+            assert_eq!(listed(), expected);
+            assert!(!blocked.exists());
+            println!("persisted all six early keys without an application library");
+        } else {
+            assert_eq!(phase, "read");
+            assert!(wanted_early(FIRST));
+            assert!(wanted_early(SECOND));
+            assert!((0..4).all(|worker| wanted_early(&worker_key(worker))));
+            assert!(!wanted_early("unlisted"));
+            println!("fresh process reloaded all six early keys");
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
