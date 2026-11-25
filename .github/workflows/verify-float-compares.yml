@@ -1,0 +1,41 @@
+name: Constant floating compares on WARP
+on:
+  push:
+    branches: [verify/warp-constant-float-compares-dbd9a89]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      VICTORY_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm the tested source
+        shell: pwsh
+        run: |
+          $parent = git rev-parse HEAD^
+          if ($LASTEXITCODE -or $parent -ne 'dbd9a894099845977fca87c8fdf66a4115897c98') {
+            throw "Unexpected verification parent $parent"
+          }
+          $files = git diff --name-only HEAD^ HEAD
+          if ($LASTEXITCODE -or @($files).Count -ne 1 -or $files -ne '.github/workflows/verify-float-compares.yml') {
+            throw "Unexpected changes in the verification commit: $files"
+          }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Verify WARP readback on the current PR source
+        shell: pwsh
+        run: |
+          $test = 'emit::valu_tests::float_compares_that_are_always_false_or_true'
+          $output = & cargo test --locked -p victory-shader --lib $test -- --exact --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = $output -join "`n"
+          if ($code -ne 0 -or $log -notmatch '1 passed; 0 failed; 0 ignored' -or $log -match 'device; skipped') {
+            throw 'The exact regression did not complete on WARP'
+          }
