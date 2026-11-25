@@ -1,0 +1,68 @@
+name: Compare native guarded-view refreshes at main and PR 979
+on:
+  push:
+    branches: [verify/pr-979-guard-intervals]
+permissions:
+  contents: read
+jobs:
+  compare:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    env:
+      VICTORY_GUARD_ASK: '0'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 4
+      - name: Build matched release test executables
+        shell: pwsh
+        run: |
+          $candidate = 'ac6e475108f0e82ed6efb657e4f0b7552c0275f7'
+          $baseline = '0b0074e0b2765e574c622e9a3de566f20f04135b'
+          if ((git rev-parse HEAD~2) -ne $candidate -or (git rev-parse HEAD~3) -ne $baseline) { throw 'Unexpected comparison commits' }
+          $sourcePath = 'crates/victory-gpu/src/watch/guard_benchmark.rs'
+          $source = Get-Content -LiteralPath $sourcePath
+          function Build-Probe([string] $tag) {
+            $art = @(cargo test --locked --release -p victory-gpu --features diagnostics --lib --no-run --message-format json | ForEach-Object {
+              $line = $_ | ConvertFrom-Json
+              if ($line.reason -eq 'compiler-artifact' -and $line.target.name -eq 'victory_gpu' -and $line.profile.test -and $line.executable) {
+                $line.executable
+              } elseif ($line.reason -eq 'compiler-message' -and $line.message.level -eq 'error') {
+                Write-Host $line.message.rendered
+              }
+            })
+            if ($LASTEXITCODE -ne 0 -or $art.Count -ne 1) { throw "Build failed for $tag" }
+            Copy-Item -LiteralPath $art[0] -Destination "$env:RUNNER_TEMP\guard-$tag.exe"
+          }
+          Build-Probe 'candidate'
+          git switch --detach $baseline
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          New-Item -ItemType Directory -Force (Split-Path $sourcePath) | Out-Null
+          Set-Content -LiteralPath $sourcePath -Value $source -Encoding utf8NoBOM
+          Add-Content -LiteralPath 'crates/victory-gpu/src/watch.rs' -Value @('', '#[cfg(test)]', 'mod guard_benchmark;')
+          Build-Probe 'baseline'
+      - name: Run every watch test in a fresh process
+        shell: pwsh
+        run: |
+          foreach ($tag in @('baseline','candidate')) {
+            $exe = "$env:RUNNER_TEMP\guard-$tag.exe"
+            $names = @(& $exe --list | ForEach-Object {
+              if ($_ -match '^(watch::tests::[^:]+): test$') { $Matches[1] }
+            })
+            $expected = if ($tag -eq 'candidate') { 13 } else { 12 }
+            if ($names.Count -ne $expected) { throw "$tag exposed $($names.Count) tests, expected $expected" }
+            foreach ($name in $names) {
+              & $exe $name --exact --nocapture
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+            Write-Output "$tag passed $expected isolated watch tests"
+          }
+      - name: Measure the same mapped view in alternating binaries
+        shell: pwsh
+        run: |
+          foreach ($tag in @('baseline','candidate','candidate','baseline')) {
+            Write-Output "guard_measurement $tag"
+            & "$env:RUNNER_TEMP\guard-$tag.exe" watch::guard_benchmark::native_guard_queries_over_a_174_mib_view --exact --ignored --nocapture
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
