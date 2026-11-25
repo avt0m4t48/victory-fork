@@ -229,6 +229,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_closed_unsubmitted_list_keeps_its_timestamp_pair() {
+        assert!(on(), "set VICTORY_CARD_METER=1");
+        let host = crate::host::host().expect("a WARP host");
+        let older = host.new_list().unwrap();
+        let recorded = begin(&older.list, Kind::Lists);
+        assert_ne!(recorded.raw(), Span::NONE.raw());
+        end(&older.list, recorded);
+        older.close();
+
+        // Nothing has submitted this list. Age its pending entry to
+        // exercise the same collection path as a late submission.
+        {
+            let mut meter = METER.lock().unwrap();
+            let m = meter.as_mut().unwrap().as_mut().unwrap();
+            let pending = m.pending.iter_mut().find(|p| p.0 == recorded.raw()).unwrap();
+            pending.2 = std::time::Instant::now() - AFTER * 2;
+        }
+        collect();
+        // Place the cursor at the wrap point, as it could reach after the
+        // remaining slots have been allocated and collected.
+        METER.lock().unwrap().as_mut().unwrap().as_mut().unwrap().next = recorded.raw();
+
+        let newer = host.new_list().unwrap();
+        let reused = begin(&newer.list, Kind::Sync);
+        assert_ne!(reused.raw(), Span::NONE.raw(), "free slots remain in the ring");
+        end(&newer.list, reused);
+        newer.close();
+        assert_ne!(reused.raw(), recorded.raw(), "a newer list must not reuse an unsubmitted list's query pair");
+    }
+
+    #[test]
     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {
         assert_eq!(micros(1_000, 11_000, 10_000_000), 1_000);
         assert_eq!(micros(0, 25_000_000, 25_000_000), 1_000_000);
