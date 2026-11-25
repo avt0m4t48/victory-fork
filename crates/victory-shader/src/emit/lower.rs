@@ -1012,7 +1012,7 @@ thread_local! {
 /// Whether a dispatch of more groups in `x` than the host runs is split into
 /// several, each told where its groups start ([`Lower::compute_id`]):
 /// on, `VICTORY_GROUP_SPLIT=0` as before (the first 65,535 groups only).
-fn group_split_on() -> bool {
+pub fn group_split_on() -> bool {
     #[cfg(test)]
     if let Some(on) = TEST_GROUP_SPLIT.get() {
         return on;
@@ -11856,6 +11856,12 @@ mod tests {
         };
         TEST_GROUP_SPLIT.set(Some(true));
         assert!(base(&lowers_ids(&words, group_id_x).expect("group id")));
+        assert!(!base(&lowers_ids(&words, 1 << 8).expect("group id Y")));
+        let local_x: Vec<_> = [0x7E00_0500] // v_readfirstlane_b32 s0, v0 (local X)
+            .into_iter()
+            .chain(words)
+            .collect();
+        assert!(!base(&lowers_ids(&local_x, 0).expect("local id X")));
         TEST_GROUP_SPLIT.set(Some(false));
         assert!(!base(&lowers_ids(&words, group_id_x).expect("group id")));
         TEST_GROUP_SPLIT.set(None);

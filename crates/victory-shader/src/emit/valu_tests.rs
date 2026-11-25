@@ -201,6 +201,7 @@ fn build_cs_with_group_id(body: &[u32], threads: u32, lds_bytes: u32, group_id: 
 
 #[test]
 fn group_base_rebases_group_x_without_shifting_local_x() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let mut words = vec![vop1(0x001, 5, sgpr(6))]; // v5 = group X
     words.extend(buffer_store_dword(5, 8, 4));
     let shader = build_cs_with_group_id(&words, 1, 0, true);

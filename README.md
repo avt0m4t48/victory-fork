@@ -195,8 +195,9 @@ What did it, on top of the list below:
 - A dispatch whose group count is known on the processor (`Dispatch`,
   `DispatchX`, `DispatchMesh`) and asks for more groups in x than the host
   runs is now run whole: the host runs it as pieces of at most 65,535, and the
-  translated program adds the piece's first group to its group id (compute
-  and mesh stages; `VICTORY_GROUP_SPLIT=0` gives the old truncation back).
+  translated program adds the piece's first group to group ID X when it reads
+  that coordinate. Compute and mesh stages still run every piece when they
+  do not read group ID X. `VICTORY_GROUP_SPLIT=0` restores truncation.
   Built and unit-tested; not yet seen in a run of the title here.
 - Known and counted, still not fixed: a group count that arrives in GPU
   memory is clamped instead (the indirect light pass's compute record that
