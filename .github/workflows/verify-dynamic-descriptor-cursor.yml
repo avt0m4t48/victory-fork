@@ -1,0 +1,46 @@
+name: Descriptor allocator cursor regression
+on:
+  push:
+    branches: [verify/dynamic-descriptor-cursor]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    env:
+      VICTORY_D3D12_WARP: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 4
+      - name: Confirm the source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '34a7ebd12d49058a666a4388d44f3118c478014c') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-dynamic-descriptor-cursor.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Exercise the descriptor allocator on WARP
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib dynamic_slots_ -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = Join-String -InputObject $output -Separator ' '
+          if ($code -ne 0 -or $log -notmatch 'allocated the free run across the cursor' -or $log -notmatch '2 passed; 0 failed') {
+            throw 'The allocator tests did not execute and pass on WARP'
+          }
+      - name: Test the original search with the same regression
+        shell: pwsh
+        run: |
+          git restore --source=bfbc2aff7994f8cca49297e906bf6bccd08d1e4f -- crates/victory-gpu/src/descriptor/host.rs
+          if ($LASTEXITCODE) { throw 'Unable to restore the original search' }
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib dynamic_slots_can_span_the_search_cursor -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = Join-String -InputObject $output -Separator ' '
+          if ($code -ne 101 -or $log -notmatch 'left:\s*None' -or $log -notmatch 'right:\s*Some\(\s*14') {
+            throw 'The original search did not fail at the cursor-spanning range'
+          }
