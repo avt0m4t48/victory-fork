@@ -574,6 +574,56 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod direct_fence_probe {
+    use super::*;
+
+    #[test]
+    fn synchronous_submit_stops_when_the_fence_wait_fails() {
+        const CHILD: &str = "VICTORY_TEST_DIRECT_FENCE_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            on_failure(|message| {
+                eprintln!("reported direct fence failure: {message}");
+                std::process::exit(42);
+            });
+            let host = host().expect("WARP device in the child process");
+            // SAFETY: The unsignalled fence gates the isolated software
+            // queue so there is definitely unfinished work at the fault.
+            let gate: ID3D12Fence =
+                unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+            let list = host.new_list().unwrap();
+            list.close();
+            host.execute(&[&list]);
+
+            let expected = *host.submitted.lock().unwrap();
+            let completed = unsafe { host.fence.GetCompletedValue() };
+            assert!(completed < expected);
+            assert_eq!(FINISHED.load(Ordering::Acquire), STARTED.load(Ordering::Acquire));
+            eprintln!("marked direct work finished with fence {completed} below {expected}");
+            // SAFETY: Release the test's own gate and wait before exiting.
+            unsafe {
+                gate.Signal(1).unwrap();
+                host.fence.SetEventOnCompletion(expected, HANDLE::default()).unwrap();
+            }
+            std::process::exit(0);
+        }
+        let fault = std::env::var("VICTORY_TEST_DIRECT_FENCE_MODE")
+            .unwrap_or_else(|_| "registration".into());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host::direct_fence_probe::synchronous_submit_stops_when_the_fence_wait_fails", "--nocapture"])
+            .env(CHILD, fault)
+            .env("VICTORY_D3D12_WARP", "1")
+            .env("VICTORY_LATE_WAIT", "0")
+            .env_remove("VICTORY_GPU_TIMING")
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(42), "{stderr}");
+        assert!(stderr.contains("reported direct fence failure"), "{stderr}");
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -5479,10 +5529,24 @@ impl Host {
                 let waited = self
                     .queue
                     .Signal(&self.fence, *submitted)
-                    .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
+                    .and_then(|()| {
+                        #[cfg(test)]
+                        if std::env::var("VICTORY_TEST_DIRECT_FENCE_CHILD").as_deref() == Ok("registration") {
+                            return Err(windows::Win32::Foundation::E_OUTOFMEMORY.into());
+                        }
+                        self.fence.SetEventOnCompletion(*submitted, self.event)
+                    });
                 match waited {
                     Ok(()) => {
                         working(false);
+                        #[cfg(test)]
+                        let _status = if std::env::var("VICTORY_TEST_DIRECT_FENCE_CHILD").as_deref() == Ok("wait") {
+                            windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_INVALID_HANDLE);
+                            windows::Win32::Foundation::WAIT_FAILED
+                        } else {
+                            WaitForSingleObject(self.event, INFINITE)
+                        };
+                        #[cfg(not(test))]
                         WaitForSingleObject(self.event, INFINITE);
                         stood(started);
                         working(true);
