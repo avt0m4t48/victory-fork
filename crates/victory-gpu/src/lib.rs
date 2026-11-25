@@ -55,6 +55,8 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod readwatch;
 
 #[cfg(windows)]
 pub use host::on_failure;

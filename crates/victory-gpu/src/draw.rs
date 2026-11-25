@@ -618,6 +618,8 @@ impl State {
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(record.resource);
+            #[cfg(feature = "diagnostics")]
+            crate::readwatch::gpu_writes(record.resource, "target");
             let desc = record.desc();
             if let Some(slot) = self.target_formats.get_mut(rtvs.len()) {
                 // The view's format, else the texture's own (a view without
@@ -3261,6 +3263,8 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
         (View::Unordered(resource, _, _), ResourceType::Uav) => {
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(*resource as This);
+            #[cfg(feature = "diagnostics")]
+            crate::readwatch::gpu_writes(*resource as This, "unordered");
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
                 crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);

@@ -2293,6 +2293,29 @@ pub(crate) fn placed_filler_twins() -> u64 {
     PLACED_TWINS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Where texture `this` lies in title memory, the bytes it takes there and
+/// its description in short (diagnostics: `crate::readwatch`); `None` for a
+/// buffer or a description without a size.
+#[cfg(all(windows, feature = "diagnostics"))]
+pub(crate) fn title_span(this: This) -> Option<(usize, usize, String)> {
+    if this.is_null() {
+        return None;
+    }
+    let r = resource(this);
+    if r.desc.dimension == BUFFER {
+        return None;
+    }
+    let size = footprint(&r.desc)?.size;
+    Some((
+        r.data() as usize,
+        size as usize,
+        format!(
+            "{}x{}x{} mips {} f{}",
+            r.desc.width, r.desc.height, r.desc.depth_or_array_size, r.desc.mip_levels, r.desc.format
+        ),
+    ))
+}
+
 /// The bytes of title memory a texture with the resource description
 /// `desc` (as words) takes where the title placed it; `None` for a buffer
 /// and for a description without a size.
