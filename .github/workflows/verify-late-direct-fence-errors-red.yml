@@ -1,0 +1,36 @@
+name: Observe early completion of a late WARP submission after a failed wait
+on:
+  push:
+    branches: [verify/late-direct-fence-errors-red]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 4
+      - name: Check the published direct fix and late-only probe
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD~2) -ne 'cf9904bb75a331f66cee9707f2d71de79f912c28') { throw 'Unexpected baseline' }
+          if ((git diff --name-only HEAD~2 HEAD~1) -ne 'crates/victory-gpu/src/host.rs') { throw 'Unexpected probe changes' }
+      - name: Confirm both errors land work while the queue remains gated
+        shell: pwsh
+        run: |
+          $test = 'host::late_fence_probe::waits_for_a_flight_before_its_bottom_of_pipe_write'
+          cargo test --locked -p victory-gpu --features diagnostics --lib --no-run
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($mode in @('registration','wait')) {
+            $env:VICTORY_TEST_LATE_FENCE_MODE = $mode
+            $log = cargo test --locked -p victory-gpu --features diagnostics --lib $test -- --exact --nocapture 2>&1 | Out-String
+            $code = $LASTEXITCODE
+            Write-Output $log
+            if ($code -ne 101 -or $log -notmatch 'landed the late write and published completion with fence 0 below 1') { throw "Expected the gated $mode error to land work" }
+          }
+          $env:VICTORY_TEST_LATE_FENCE_MODE = 'healthy'
+          cargo test --locked -p victory-gpu --features diagnostics --lib $test -- --exact --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
