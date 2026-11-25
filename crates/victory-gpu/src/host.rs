@@ -213,11 +213,85 @@ pub(crate) fn retire<T: 'static>(object: T) {
         drop(object);
         return;
     }
+    #[cfg(test)]
+    retirement_race_probe::pause_before_queueing();
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
     RETIRED
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .push((started, Retired(Box::new(object))));
+}
+
+#[cfg(test)]
+mod retirement_race_probe {
+    use super::*;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    const PAUSED_THREAD: &str = "probe-retirement-after-fence";
+    static SAW_PENDING: Barrier = Barrier::new(2);
+    static RESUME: Barrier = Barrier::new(2);
+
+    pub(super) fn pause_before_queueing() {
+        if thread::current().name() == Some(PAUSED_THREAD) {
+            SAW_PENDING.wait();
+            RESUME.wait();
+        }
+    }
+
+    struct Mark(Arc<AtomicU32>);
+
+    impl Drop for Mark {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    #[test]
+    fn retirement_racing_completion_is_dropped_without_a_later_submission() {
+        let host = host().expect("an isolated WARP device");
+        // SAFETY: only this probe uses the queue and holds the gate.
+        let gate: ID3D12Fence =
+            unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+        unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+        let submit = thread::spawn(move || {
+            let list = host.new_list().unwrap();
+            list.close();
+            host.execute(&[&list]);
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while STARTED.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "the direct submission did not start");
+            thread::yield_now();
+        }
+        assert_eq!(FINISHED.load(Ordering::Acquire), 0);
+        let ordinary = Arc::new(AtomicU32::new(0));
+        retire(Mark(ordinary.clone()));
+        assert_eq!(ordinary.load(Ordering::Acquire), 0);
+
+        let raced = Arc::new(AtomicU32::new(0));
+        let retiring = {
+            let marker = Mark(raced.clone());
+            thread::Builder::new().name(PAUSED_THREAD.into())
+                .spawn(move || retire(marker)).unwrap()
+        };
+        SAW_PENDING.wait();
+        // SAFETY: only this probe signals its own fence.
+        unsafe { gate.Signal(1) }.unwrap();
+        submit.join().unwrap();
+        assert_eq!(unsafe { host.fence.GetCompletedValue() }, 1);
+        assert_eq!(FINISHED.load(Ordering::Acquire), 1);
+        assert_eq!(ordinary.load(Ordering::Acquire), 1, "normal retirement at completion");
+
+        RESUME.wait();
+        retiring.join().unwrap();
+        assert_eq!(raced.load(Ordering::Acquire), 1, "retirement missed the final submission's completion");
+        let immediate = Arc::new(AtomicU32::new(0));
+        retire(Mark(immediate.clone()));
+        assert_eq!(immediate.load(Ordering::Acquire), 1);
+        eprintln!("normal queued, raced, and idle retirements all dropped exactly once");
+    }
 }
 
 /// Drops what waited for submissions up to `finished`.
