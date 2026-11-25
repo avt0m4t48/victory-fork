@@ -19,7 +19,7 @@ use windows::core::{Interface, PCSTR};
 /// executions, #107), records a window holds, and how far apart the
 /// records are (the title keeps them 32 bytes apart).
 const DRAWS: u32 = 3200;
-const WINDOW: u32 = 32;
+const WINDOW: u32 = 512;
 const STEP: u32 = 32;
 const RUNS: usize = 9;
 
@@ -59,21 +59,19 @@ fn compile(entry: &str, target: &str) -> Vec<u8> {
     }
 }
 
-/// The clamp as it was before it charged the budget once per group
-/// (record by record, every thread racing for the budget word), kept
-/// here to measure against.
+/// The exact parallel-dispatch clamp from a253706.
 const OLD_SOURCE: &str = r#"
 #define RS "RootConstants(num32BitConstants=6, b0), SRV(t0), SRV(t1), UAV(u0), UAV(u1)"
 cbuffer Record : register(b0) {
-uint kind;
-uint stride;
-uint records;
-uint args_offset;
-// Bit 0: a count buffer bounds the records. Bit 1: the records are a
-// window clamped ahead of their draws: one that asks for more than can
-// run is left empty and costs nothing.
-uint has_count;
-uint count_offset;
+    uint kind;
+    uint stride;
+    uint records;
+    uint args_offset;
+    // Bit 0: a count buffer bounds the records. Bit 1: the records are a
+    // window clamped ahead of their draws: one that asks for more than can
+    // run is left empty and costs nothing.
+    uint has_count;
+    uint count_offset;
 };
 ByteAddressBuffer src_args : register(t0);
 ByteAddressBuffer count_buf : register(t1);
@@ -82,89 +80,163 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// The vertices or indices an instance from which a draw record runs empty.
+static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
+// Each group charges the budget once: the costs of its records go here,
+// one thread charges their sum, saturating as each record would in lane
+// order, and every thread then reads whether its own record fitted. A
+// compare and swap per record, 64 threads racing for one word, cost a
+// round for each record of a window, and in memory the CPU maps (where the
+// budget was, and is with VICTORY_INDIRECT_CARD_BUDGET=0) every atomic
+// crosses the bus on a card of its own.
+groupshared uint costs[64];
+groupshared uint fits[64];
+groupshared uint largest_asked;
+groupshared uint all_asked;
 [RootSignature(RS)]
 [numthreads(64, 1, 1)]
-void main(uint3 id : SV_DispatchThreadID) {
-uint eff_count = records;
-bool ahead = (has_count & 2u) != 0;
-if ((has_count & 1u) != 0) {
-    eff_count = min(eff_count, count_buf.Load(count_offset));
-}
-if (id.x >= eff_count) return;
-uint src_at = args_offset + id.x * stride;
-uint dst_at = id.x * stride;
-uint cost;
-uint2 draw_counts = uint2(0, 0);
-uint3 groups = uint3(0, 0, 0);
-if (kind <= 1) {
-    // Draws: vertex or index count, then instances.
-    uint2 asked = src_args.Load2(src_at);
-    if (ahead && (asked.x > (1u << 24) || asked.y > (1u << 24))) {
-        asked = uint2(0, 0);
+void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+    uint eff_count = records;
+    bool ahead = (has_count & 2u) != 0;
+    if ((has_count & 1u) != 0) {
+        eff_count = min(eff_count, count_buf.Load(count_offset));
     }
-    uint count = min(asked.x, 1u << 24);
-    uint instances = min(asked.y, (1u << 26) / max(count, 1u));
-    cost = count * instances;
-    draw_counts = uint2(count, instances);
-} else if (kind == 2) {
-    uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
-    // x * y fits 32 bits; the whole count may not.
-    if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
-        g = uint3(0, 0, 0);
+    // Threads past the records take part in the group's charge (cost 0)
+    // and store nothing.
+    bool active = id.x < eff_count;
+    uint src_at = args_offset + id.x * stride;
+    uint dst_at = id.x * stride;
+    uint cost = 0;
+    uint asked = 0;
+    uint2 draw_counts = uint2(0, 0);
+    uint3 groups = uint3(0, 0, 0);
+    if (gi == 0) {
+        largest_asked = 0;
+        all_asked = 0;
     }
-    cost = g.x * g.y * g.z * 64u;
-    groups = g;
-} else {
-    // Mesh dispatches: the console's are one-dimensional.
-    uint3 g = src_args.Load3(src_at);
-    // Ahead of its draw, a record over the most a dispatch runs is a
-    // slot the title has not filled (the title leaves all
-    // ones there): empty, and not counted below either.
-    if (ahead && g.x > 65535u) {
-        g = uint3(0, 0, 0);
+    if (active && kind <= 1) {
+        // Draws: vertex or index count, then instances.
+        uint2 want = src_args.Load2(src_at);
+        if (ahead && (want.x > (1u << 24) || want.y > (1u << 24))) {
+            want = uint2(0, 0);
+        }
+        uint count = min(want.x, 1u << 24);
+        uint instances = min(want.y, (1u << 26) / max(count, 1u));
+        cost = count * instances;
+        // A record that asks for MOST_DRAW vertices or indices an instance
+        // or more is no draw of the title's (no mesh of a console title has
+        // 2.8 million triangles): it runs empty and charges nothing. Run
+        // 206's window check found one list with 90 draws of 2^24 vertices
+        // and one instance each. Clamped one draw at a time, the list's
+        // budget lets eight of them run (2^27 in all) and empties the other
+        // 82; served from a window, whose records are charged once however
+        // often they are drawn, all 90 ran: 1.5 thousand million vertices
+        // in one list, with windows on in the runs that lost the device
+        // (201, 204).
+        if (count >= MOST_DRAW) {
+            count = 0;
+            instances = 0;
+            cost = 0;
+        }
+        draw_counts = uint2(count, instances);
+    } else if (active && kind == 2) {
+        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
+        // x * y fits 32 bits; the whole count may not.
+        if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+            g = uint3(0, 0, 0);
+        }
+        cost = g.x * g.y * g.z * 64u;
+        groups = g;
+    } else if (active) {
+        // Mesh dispatches: the console's are one-dimensional.
+        uint3 g = src_args.Load3(src_at);
+        // Ahead of its draw, a record over the most a dispatch runs is a
+        // slot the title has not filled (the title leaves all
+        // ones there): empty, and not counted below either.
+        if (ahead && g.x > 65535u) {
+            g = uint3(0, 0, 0);
+        }
+        asked = g.x;
+        g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
+        cost = g.x * g.y * g.z * 128u;
+        groups = g;
     }
-    // Diagnostics, in the budget buffer's next words: the largest
-    // group count a mesh record asked for, and the groups asked in all.
-    uint was;
-    budget.InterlockedMax(4, g.x, was);
-    budget.InterlockedAdd(8, min(g.x, 1u << 24), was);
-    g = uint3(min(g.x, 65535u), min(g.y, 1u), min(g.z, 1u));
-    cost = g.x * g.y * g.z * 128u;
-    groups = g;
-}
-bool over = false;
-if (cost > 0) {
-    uint before;
-    budget.InterlockedOr(0, 0, before);
-    [allow_uav_condition]
-    while (before < BUDGET) {
-        uint next = (BUDGET - before <= cost) ? BUDGET : (before + cost);
-        uint prev;
-        budget.InterlockedCompareExchange(0, before, next, prev);
-        if (prev == before) break;
-        before = prev;
+    costs[gi] = cost;
+    GroupMemoryBarrierWithGroupSync();
+    if (active && kind > 2) {
+        // Diagnostics, in the budget buffer's next words (below): the
+        // largest group count a mesh record asked for, and the groups
+        // asked in all.
+        uint was;
+        InterlockedMax(largest_asked, asked, was);
+        InterlockedAdd(all_asked, min(asked, 1u << 24), was);
     }
-    over = before >= BUDGET || BUDGET - before < cost;
-}
-if (kind <= 1) {
-    if (over) {
-        draw_counts = uint2(0, 0);
+    // The group's own records: none for a group past a count buffer's
+    // count (an execution may ask for thousands and count a few), which
+    // touches the budget not at all, as its threads did not before.
+    uint first = id.x - gi;
+    uint n = eff_count > first ? min(64u, eff_count - first) : 0u;
+    if (gi == 0 && n > 0) {
+        // What the records charge, from `before` on, in lane order: a
+        // record that does not fit whole runs empty and takes the rest.
+        // Only the group's own records are walked (one, clamped alone).
+        uint before;
+        budget.InterlockedOr(0, 0, before);
+        [allow_uav_condition]
+        while (before < BUDGET) {
+            uint next = before;
+            for (uint j = 0; j < n; j++) {
+                uint c = costs[j];
+                if (c > 0 && next < BUDGET) {
+                    next = (BUDGET - next <= c) ? BUDGET : (next + c);
+                }
+            }
+            if (next == before) break;
+            uint prev;
+            budget.InterlockedCompareExchange(0, before, next, prev);
+            if (prev == before) break;
+            before = prev;
+        }
+        uint at = before;
+        for (uint k = 0; k < n; k++) {
+            uint c = costs[k];
+            uint fit = 1;
+            if (c > 0) {
+                fit = (at < BUDGET && BUDGET - at >= c) ? 1u : 0u;
+                at = (at >= BUDGET || BUDGET - at <= c) ? BUDGET : (at + c);
+            }
+            fits[k] = fit;
+        }
     }
-    dst_args.Store2(dst_at, draw_counts);
-    for (uint off = 8; off < stride; off += 4) {
-        dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+    GroupMemoryBarrierWithGroupSync();
+    if (gi == 0 && kind > 2 && n > 0) {
+        uint was;
+        budget.InterlockedMax(4, largest_asked, was);
+        budget.InterlockedAdd(8, all_asked, was);
     }
-} else {
-    if (over) {
-        groups = uint3(0, 0, 0);
+    if (!active) {
+        return;
     }
-    dst_args.Store3(dst_at, groups);
-    for (uint off = 12; off < stride; off += 4) {
-        dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+    bool over = fits[gi] == 0;
+    if (kind <= 1) {
+        if (over) {
+            draw_counts = uint2(0, 0);
+        }
+        dst_args.Store2(dst_at, draw_counts);
+        for (uint off = 8; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
+    } else {
+        if (over) {
+            groups = uint3(0, 0, 0);
+        }
+        dst_args.Store3(dst_at, groups);
+        for (uint off = 12; off < stride; off += 4) {
+            dst_args.Store(dst_at + off, src_args.Load(src_at + off));
+        }
     }
-}
 }
 "#;
 
@@ -445,19 +517,16 @@ fn bench_indirect_draw_barriers() {
             [gpu, recorded, ran]
         };
 
-        // What `main` records, then this branch; the windows a step at a
-        // time (barriers, then the clamp's one charge per group).
         let (old, new) = (&clamps[0], &clamps[1]);
-        // The last two keep the budget in the card's memory instead of
-        // memory the CPU maps (where the list's budget is now).
-        let cases: [(&str, Barriers, &Clamp, u32, bool); 7] = [
-            ("one at a time, main", Barriers::Old, old, 1, false),
-            ("one at a time, this", Barriers::New, new, 1, false),
-            ("windows of 32, main", Barriers::Old, old, WINDOW, false),
-            ("windows, new barriers", Barriers::New, old, WINDOW, false),
-            ("windows of 32, this", Barriers::New, new, WINDOW, false),
-            ("one at a time, card", Barriers::New, new, 1, true),
-            ("windows of 32, card", Barriers::New, new, WINDOW, true),
+        let cases = [
+            ("32 records parallel", Barriers::New, old, 32, false),
+            ("32 records ordered", Barriers::New, new, 32, false),
+            ("64 records parallel", Barriers::New, old, 64, false),
+            ("64 records ordered", Barriers::New, new, 64, false),
+            ("128 records parallel", Barriers::New, old, 128, false),
+            ("128 records ordered", Barriers::New, new, 128, false),
+            ("512 records parallel", Barriers::New, old, 512, false),
+            ("512 records ordered", Barriers::New, new, 512, false),
         ];
         // Warm up, then the cases in turn, so drift falls on all alike.
         for &(_, barriers, clamp, window, card) in &cases {
@@ -488,7 +557,7 @@ fn bench_indirect_draw_barriers() {
                 median(&times[i], 2),
             );
         }
-        for (from, to) in [(0, 1), (2, 3), (3, 4), (2, 4), (1, 5), (4, 6)] {
+        for (from, to) in [(0, 1), (2, 3), (4, 5), (6, 7)] {
             let (a, b) = (median(&times[from], 0), median(&times[to], 0));
             eprintln!(
                 "  {} -> {}: GPU time {:+.1} %",
