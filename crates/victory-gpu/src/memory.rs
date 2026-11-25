@@ -317,3 +317,92 @@ pub(crate) fn ready(
         base,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
+    };
+
+    #[test]
+    fn closed_lists_can_see_directory_entries_published_by_later_recording() {
+        let host = host().expect("WARP is required for this probe");
+        let candidate = (0..16)
+            .map(|slot| 0x4_2000_0000 + slot * CELL)
+            .find_map(|address| {
+                // SAFETY: ask for our own fresh page inside the directory's range.
+                let at = unsafe { VirtualAlloc(address as *const _, PAGE as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+                (!at.is_null()).then_some(at)
+            })
+            .expect("allocate a synthetic title page");
+        let address = candidate as u64;
+        assert!(address / PAGE < u64::from(MEMORY_PAGES) - 1);
+        crate::shadow::register(1, address, PAGE);
+        let heap_a = HostHeap::new(false, 1).unwrap();
+        let heap_b = HostHeap::new(false, 1).unwrap();
+        let key_a = std::ptr::from_ref(&heap_a) as usize;
+        let key_b = std::ptr::from_ref(&heap_b) as usize;
+
+        let record = || {
+            let list = host.new_list().unwrap();
+            let binding = ready(&list, &heap_a, &[], &[], true).unwrap();
+            let target = host.read_back_buffer(8).unwrap();
+            {
+                let guard = MEMORY.lock().unwrap();
+                let directory = &guard.as_ref().unwrap().directory;
+                assert_eq!(binding.directory, directory.2);
+                // SAFETY: open list; copy the two directory words using valid resources.
+                unsafe { list.list.CopyBufferRegion(&target, 0, &directory.0, address / PAGE * 8, 8) };
+            }
+            list.close();
+            (list, target)
+        };
+        let read = |target: &ID3D12Resource| {
+            let mut data = std::ptr::null_mut();
+            // SAFETY: after the list's wait, read both copied words and unmap.
+            unsafe {
+                target.Map(0, Some(&D3D12_RANGE { Begin: 0, End: 8 }), Some(&mut data)).unwrap();
+                let words = data.cast::<[u32; 2]>().read();
+                target.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+                words
+            }
+        };
+        let (control, control_target) = record();
+        let (different_heap, different_target) = record();
+        let (same_heap, same_target) = record();
+        host.execute(&[&control]);
+        assert_eq!(read(&control_target), [0, 0]);
+
+        let discover = host.new_list().unwrap();
+        let new_binding = ready(&discover, &heap_b, &[address], &[], true).unwrap();
+        discover.close();
+        assert_eq!(discover.test_shadow_steps(address as usize), (true, true));
+        {
+            let guard = MEMORY.lock().unwrap();
+            let memory = guard.as_ref().unwrap();
+            assert_eq!(memory.heaps[&key_a].1, 0);
+            assert_eq!(memory.heaps[&key_b], (new_binding.base, 1));
+        }
+        host.execute(&[&different_heap]);
+        assert_eq!(read(&different_target), [1, 0]);
+        assert_eq!(different_heap.test_shadow_steps(address as usize), (false, false));
+        eprintln!("WARP copied directory [1, 0] from an earlier list whose separate heap had 0 installed copies");
+
+        let install = host.new_list().unwrap();
+        ready(&install, &heap_a, &[address], &[], true).unwrap();
+        install.close();
+        assert_eq!(install.test_shadow_steps(address as usize), (true, true));
+        assert_eq!(MEMORY.lock().unwrap().as_ref().unwrap().heaps[&key_a].1, 1);
+        host.execute(&[&same_heap]);
+        assert_eq!(read(&same_target), [1, 0]);
+        assert_eq!(same_heap.test_shadow_steps(address as usize), (false, false));
+        eprintln!("same heap had copy #1 installed, while the earlier list still had neither refresh nor write-back coverage");
+
+        drop((control, different_heap, same_heap, discover, install));
+        MEMORY.lock().unwrap().take();
+        crate::shadow::unregister(1, address);
+        // SAFETY: release only the probe's private allocation.
+        assert_ne!(unsafe { VirtualFree(candidate, 0, MEM_RELEASE) }, 0);
+    }
+}
