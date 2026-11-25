@@ -3507,13 +3507,6 @@ impl Host {
                     }
                 }
                 relay_hand_back(&back);
-                // Only now, and flight by flight: a range another flight
-                // in the air declared too stays closed to refreshes.
-                for flight in &flights {
-                    for (shadow, ranges) in &flight.back {
-                        shadow.copy_back_done(ranges);
-                    }
-                }
                 COPY_BACK[0].fetch_add(landing.elapsed().as_micros() as u64, Ordering::Relaxed);
                 RELAY_STATS[0].fetch_add(1, Ordering::Relaxed);
                 RELAY_STATS[1].fetch_add(flights.len() as u64, Ordering::Relaxed);
@@ -3522,6 +3515,11 @@ impl Host {
         // In the order given: what tells the title the card is done.
         let mut last = 0;
         let mut landed = Vec::new();
+        // Collect the back ranges before consuming `items`: `copy_back_done`
+        // must run after `line.written` is updated and waiters are woken, so
+        // no other thread can see a range as free while its merge is still in
+        // flight (the race behind the loading-time 0xc0000005 crashes).
+        let mut backs: Vec<(std::sync::Arc<crate::shadow::Shadow>, Vec<(usize, usize)>)> = Vec::new();
         for item in items {
             match item {
                 Late::Run(flight) => {
@@ -3533,6 +3531,18 @@ impl Host {
                         self.card_done(card);
                     }
                     landed.push((flight.lists, flight.order));
+                    for (shadow, ranges) in &flight.back {
+                        match backs.iter_mut().find(|(s, _)| std::sync::Arc::ptr_eq(s, shadow)) {
+                            Some((_, all)) => {
+                                for range in ranges {
+                                    if !all.contains(range) {
+                                        all.push(*range);
+                                    }
+                                }
+                            }
+                            None => backs.push((shadow.clone(), ranges.clone())),
+                        }
+                    }
                 }
                 Late::Write(at, what, bytes) => what.write(at as *mut u8, bytes),
                 Late::Signal(fence, value) => crate::fence::set(fence as crate::object::This, value),
@@ -3576,6 +3586,15 @@ impl Host {
         }
         LINE_MOVED.notify_all();
         LINE_LANDED.notify_all();
+        // Only now: release the declared ranges from `pending`, after
+        // `line.written` no longer names them and every waiter has been
+        // woken. Before this point a concurrent refresh could see the range
+        // as free while the merge was still writing title memory, leaving
+        // the title with stale or unmapped bytes (the 0xc0000005 crashes
+        // during loading with VICTORY_RELAY=2).
+        for (shadow, ranges) in &backs {
+            shadow.copy_back_done(ranges);
+        }
     }
 
     /// After a submission ran, for copies in the card's memory: the pieces
