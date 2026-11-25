@@ -31,19 +31,36 @@ fn kinds() -> &'static [(u64, u32, u32)] {
     KINDS.get_or_init(|| {
         const DEFAULT: &str = "256x256f41,256x256f16,64x64f16,128x128f36";
         let list = std::env::var("VICTORY_TEXTURE_BACK").unwrap_or_else(|_| DEFAULT.to_owned());
-        let kinds: Vec<(u64, u32, u32)> = list
-            .split(',')
-            .filter_map(|k| {
-                let (size, format) = k.trim().split_once('f')?;
-                let (w, h) = size.split_once('x')?;
-                Some((w.parse().ok()?, h.parse().ok()?, format.parse().ok()?))
-            })
-            .collect();
+        if matches!(list.trim(), "" | "0") {
+            return Vec::new();
+        }
+
+        let mut kinds = Vec::new();
+        let mut invalid = Vec::new();
+        for entry in list.split(',').map(str::trim) {
+            if let Some(kind) = parse_kind(entry) {
+                kinds.push(kind);
+            } else {
+                invalid.push(entry);
+            }
+        }
+        if !invalid.is_empty() {
+            tracing::warn!(
+                invalid = ?invalid,
+                "ignoring malformed VICTORY_TEXTURE_BACK entries; use a comma-separated list of <width>x<height>f<format>, unset for defaults, or set 0 to disable"
+            );
+        }
         if !kinds.is_empty() {
             tracing::info!(?kinds, "textures of these kinds that shaders write are copied back into title memory (VICTORY_TEXTURE_BACK)");
         }
         kinds
     })
+}
+
+fn parse_kind(entry: &str) -> Option<(u64, u32, u32)> {
+    let (size, format) = entry.split_once('f')?;
+    let (width, height) = size.split_once('x')?;
+    Some((width.parse().ok()?, height.parse().ok()?, format.parse().ok()?))
 }
 
 /// Whether title texture `resource` is of a kind copied back.
