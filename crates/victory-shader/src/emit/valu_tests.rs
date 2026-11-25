@@ -100,6 +100,10 @@ fn build_valu_cs(body: &[u32]) -> HostShader {
 /// [`build_valu_cs`] with `threads` threads in x (thread index in `v0`
 /// on entry, before `body`) and `lds_bytes` of LDS (a multiple of 512).
 fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
+    build_cs_with_group_id(body, threads, lds_bytes, false)
+}
+
+fn build_cs_with_group_id(body: &[u32], threads: u32, lds_bytes: u32, group_id: bool) -> HostShader {
     let mut words = Vec::new();
     // s[4:5] = descriptor table address (heap index 0 -> byte offset 0).
     words.push(s_mov_b32(5, 0x80)); // inline constant 0
@@ -114,6 +118,8 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.push(S_ENDPGM);
 
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    // When enabled, group X is in s6 and s5 is free for the descriptor address.
+    let rsrc2 = if group_id { (6 << 1) | (1 << 7) } else { 5 << 1 };
     let native = NativeProgram {
         stage: HwStage::Cs,
         wave64: false,
@@ -147,7 +153,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: rsrc2 | ((lds_bytes / 512) << 15),
             threads: [threads, 1, 1],
         }),
         code,
@@ -191,6 +197,35 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     }
 
     shader
+}
+
+#[test]
+fn group_base_rebases_group_x_without_shifting_local_x() {
+    let mut words = vec![vop1(0x001, 5, sgpr(6))]; // v5 = group X
+    words.extend(buffer_store_dword(5, 8, 4));
+    let shader = build_cs_with_group_id(&words, 1, 0, true);
+    let group_root = RootType::Other(super::USER_GROUP_BASE);
+    let group_base = shader.user_data.iter().find(|u| u.root == group_root).unwrap().index;
+    let host = Host::new(true).expect("WARP device");
+    let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
+    for base in [0, 65_535] {
+        let mut words = vec![0; shader.user_data_dwords().max(1) as usize];
+        words[group_base as usize] = base;
+        let output = host.dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(words))],
+                views: &[View::RawUav(2)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        ).unwrap();
+        assert_eq!(output[0], [0, base], "group base must leave the local ID alone");
+    }
+
+    let local_only = build_valu_cs(&[]);
+    assert!(local_only.user_data.iter().all(|u| u.root != group_root));
 }
 
 /// One GPU test at a time. With these tests on the hardware adapter and WARP
