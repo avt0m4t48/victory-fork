@@ -108,6 +108,17 @@ What vx-layer adds on top of the fork's commit 4e17478:
 Measured on an RTX 4090 with all of the above: about 318 ms per frame at
 4,000-7,000 draws (3.1 fps), seven-minute runs without errors.
 
+- **Where the card's time goes** (`VICTORY_GPU_TIMING=1`, a diagnostics build;
+  frames are much slower while it is on, so `tools/vx-play.ps1` clears it): the
+  title's commands take about 95-165 ms of GPU time per frame in busy scenes.
+  About two thirds of it is indirect calls (some 3,700-5,500 a frame, each
+  preceded by the host's argument-clamp dispatch and its barriers); then
+  compute dispatches (~40 ms) and texture uploads (~30 ms).
+- **Measured and not adopted** (seven-minute runs, same scene, against the
+  318 ms above): `VICTORY_INPLACE=2` (the card reads title memory in place):
+  643 ms per frame, the copy back alone 525 ms; `VICTORY_INDIRECT_WINDOW=1`
+  (64 indirect records clamped per pass): 353 ms, no gain.
+
 Known problems (open): walls, doors or props are missing in some views and runs;
 characters are dark and glossy in some rooms; some clothing shows blocky
 patches; one compute program (alpha shadow cascades) still does

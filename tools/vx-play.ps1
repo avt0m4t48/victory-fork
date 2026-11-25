@@ -30,7 +30,8 @@ param(
 if (-not (Test-Path $Exe)) { throw "no build at ${Exe}: cargo build --release -p victory" }
 if (-not (Test-Path $GameExe)) { throw "no title executable at ${GameExe}" }
 # Test and debug switches never carry into normal play (the idea of ztrx's launcher).
-foreach ($v in 'VICTORY_KEYS', 'VICTORY_CAPTURE', 'VICTORY_CAPTURE_FRAMES', 'VICTORY_DUMP_TARGETS', 'VICTORY_LOG') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
+# (A timing run's switch left in the shell made a later run about twice as slow without a word.)
+foreach ($v in 'VICTORY_KEYS', 'VICTORY_CAPTURE', 'VICTORY_CAPTURE_FRAMES', 'VICTORY_DUMP_TARGETS', 'VICTORY_LOG', 'VICTORY_GPU_TIMING', 'VICTORY_D3D12_DRED', 'VICTORY_INPLACE_PROBE') { Remove-Item "Env:$v" -ErrorAction SilentlyContinue }
 if (Test-Path $Config) { $env:VICTORY_CONFIG = (Resolve-Path $Config).Path }
 # textures the title rewrites through another mapping are hashed every frame while they change (no
 # startup flicker; ~5-7 ms/frame)
