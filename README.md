@@ -105,6 +105,15 @@ What vx-layer adds on top of the fork's commit 4e17478:
   were missing and characters indoors were dark; in one without it, a later room
   was dark and some props were missing. Not settled yet.
 
+- **Depth planes written by shaders arrive in time.** The title's tiled lighting
+  writes each pixel's material class into a depth plane by compute and reads the
+  classes back in the same command list. The plane was drawn from its writable
+  twin only when the list closed, so those reads saw the previous frame's classes
+  (about once a frame). It is now drawn before the next draw or dispatch, and the
+  title's targets, viewports, scissors and topology are set again
+  (`VICTORY_PLANE_NOW=0`: as before). Frame line: "times used before the pass"
+  929 before, 0 after, in ten-minute runs without errors.
+
 Measured on an RTX 4090 with all of the above: about 318 ms per frame at
 4,000-7,000 draws (3.1 fps), seven-minute runs without errors.
 
