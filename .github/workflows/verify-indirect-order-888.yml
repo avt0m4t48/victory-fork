@@ -1,0 +1,37 @@
+name: Indirect draw budget ordering baseline
+on:
+  push:
+    branches: [verify/indirect-order-888-baseline]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Verify the source revision
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne 'f85101b6095e8cf3cecf8f0647cc7f5428daa177') { throw 'Unexpected base' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-indirect-order-888.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Reproduce the reported WARP draw order
+        shell: pwsh
+        run: |
+          $test = 'indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields'
+          foreach ($attempt in 1..5) {
+            $output = & cargo test --locked --release -p victory-gpu --lib $test -- --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Output $_ }
+            if ($code -eq 101 -and (Join-String -InputObject $output -Separator ' ') -match 'the first two real draws fit the budget') {
+              Write-Output "Reported WARP ordering assertion reproduced on attempt $attempt"
+              exit 0
+            }
+            if ($code -ne 0) { throw 'Unexpected failure' }
+          }
+          throw 'The Windows runner did not reproduce the reported assertion'
