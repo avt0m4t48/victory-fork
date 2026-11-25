@@ -1,0 +1,41 @@
+name: Card meter timestamp ownership on Windows WARP
+on:
+  push:
+    branches: [verify/cardmeter-query-lifetime]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    env:
+      VICTORY_D3D12_WARP: '1'
+      VICTORY_CARD_METER: '1'
+      VICTORY_FRAMETIME: '1'
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm exact patch
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '8f16b0f97dd6cb24dd26b9518d498b1a12d5f8e8') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-cardmeter-query-lifetime.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Exercise ownership, fence gating, and a real WARP timestamp pair
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib cardmeter::tests -- --test-threads=1 --nocapture
+      - name: Submit and settle title and auxiliary lists with relay and the copy queue
+        shell: pwsh
+        env:
+          VICTORY_RELAY: '2'
+          VICTORY_LATE_WAIT: '3'
+          VICTORY_QUEUE2: '3'
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib warp_title_bytes_go_up_and_shader_writes_come_back_whatever_the_queues -- --test-threads=1 --nocapture
+      - name: Check grouped submission timing
+        shell: pwsh
+        env:
+          VICTORY_GPU_TIMING: '1'
+        run: cargo test --locked -p victory-gpu --features diagnostics --lib a_host_submission_resolves_its_owned_pair -- --test-threads=1 --nocapture
+      - run: cargo run --locked --quiet --package xtask -- policy
