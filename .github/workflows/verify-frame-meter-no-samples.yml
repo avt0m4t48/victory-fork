@@ -1,0 +1,40 @@
+name: Frame meter sample reporting
+on:
+  push:
+    branches: [verify/frame-meter-valid-samples]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm the tested source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne 'cf57cf2ab7d010230d8954bcece88e5dc2b29b54') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-frame-meter-no-samples.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the GPU frame log
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib framelog::tests:: -- --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or (Join-String -InputObject $output -Separator ' ') -notmatch 'a_frame_without_gpu_samples_distinguishes_missing_time_from_zero.*ok') {
+            throw 'The frame-log regression did not pass'
+          }
+      - name: Test GPU timing sample accounting
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib cardmeter::tests:: -- --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or (Join-String -InputObject $output -Separator ' ') -notmatch 'an_unavailable_timestamp_pair_differs_from_a_measured_zero.*ok') {
+            throw 'The sample accounting regression did not pass'
+          }
