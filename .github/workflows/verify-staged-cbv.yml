@@ -1,0 +1,31 @@
+name: Staged constant buffer cap on Windows
+on:
+  push:
+    branches: [verify/staged-cbv-current-main-104]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: windows-2025
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Confirm the tested source
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne 'ee443cd62d22962d6741075c9e9fcadb4fbaae39') { throw 'Unexpected source revision' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-staged-cbv.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Test the staged constant buffer cap
+        shell: pwsh
+        run: |
+          $output = & cargo test --locked -p victory-gpu --features diagnostics --lib descriptor::tests::constant_buffer_staging_uses_only_the_host_addressable_prefix -- --exact --test-threads=1 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or (Join-String -InputObject $output -Separator ' ') -notmatch 'constant_buffer_staging_uses_only_the_host_addressable_prefix.*ok') {
+            throw 'The staged constant buffer regression did not pass'
+          }
