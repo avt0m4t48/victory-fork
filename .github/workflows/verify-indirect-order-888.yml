@@ -1,0 +1,56 @@
+name: Verify ordered indirect draw budget
+on:
+  push:
+    branches: [verify/indirect-order-888-ready]
+permissions:
+  contents: read
+jobs:
+  warp:
+    runs-on: windows-2025
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Verify the source revision
+        shell: pwsh
+        run: |
+          if ((git rev-parse HEAD^) -ne '684eb7aa53cdedf7d42782e9f998c109d07d423f') { throw 'Unexpected candidate' }
+          if ((git diff --name-only HEAD^ HEAD) -ne '.github/workflows/verify-indirect-order-888.yml') { throw 'Unexpected source changes' }
+      - run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the indirect GPU tests on Windows
+        shell: pwsh
+        run: |
+          $env:VICTORY_D3D12_WARP = '1'
+          $output = & cargo test --locked --release -p victory-gpu --features diagnostics --lib indirect::tests:: -- --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          if ($code -ne 0 -or (Join-String -InputObject $output -Separator ' ') -notmatch 'WARP kept draw records \[1, 2\]') {
+            throw 'The indirect suite did not confirm that WARP kept draws 1 and 2'
+          }
+      - name: Repeat the cross-group regression
+        shell: pwsh
+        run: |
+          $test = 'indirect::tests::warp_budget_saturates_without_wraparound_and_preserves_draw_fields'
+          foreach ($attempt in 1..7) {
+            $output = & cargo test --locked --release -p victory-gpu --features diagnostics --lib $test -- --exact --test-threads=1 --nocapture 2>&1
+            $code = $LASTEXITCODE
+            $output | ForEach-Object { Write-Output $_ }
+            if ($code -ne 0 -or (Join-String -InputObject $output -Separator ' ') -notmatch 'WARP kept draw records \[1, 2\]') {
+              throw "Unexpected WARP records on attempt $attempt"
+            }
+          }
+      - name: Exercise the legacy benchmark recorder on WARP
+        shell: pwsh
+        run: |
+          $env:VICTORY_D3D12_WARP = '1'
+          $test = 'indirect::bench::bench_indirect_draw_barriers'
+          $output = & cargo test --locked --release -p victory-gpu --features diagnostics --lib $test -- --ignored --exact --test-threads=1 --nocapture 2>&1
+          $code = $LASTEXITCODE
+          $output | ForEach-Object { Write-Output $_ }
+          $log = Join-String -InputObject $output -Separator ' '
+          if ($code -ne 0 -or $log -notmatch 'indirect draw barriers on.*Microsoft Basic Render Driver' -or $log -notmatch '1 passed; 0 failed') {
+            throw 'The legacy and ordered recording paths did not complete on WARP'
+          }
