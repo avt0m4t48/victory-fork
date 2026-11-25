@@ -100,7 +100,52 @@ impl Default for GraphicsState {
     }
 }
 
+/// Integer render target formats (`*_UINT`, `*_SINT`): the host refuses a
+/// pipeline that blends into one (debug layer: "This format does not support
+/// blending", run dbg1: the boat's windshield-wiper mask, whose third target
+/// is R8_UINT); the console's colour blocks never blend integer targets and
+/// pass the shader's bits through.
+fn integer_format(f: DXGI_FORMAT) -> bool {
+    matches!(f.0, 3 | 4 | 7 | 8 | 12 | 14 | 17 | 18 | 25 | 30 | 32 | 36 | 38 | 42 | 43 | 50 | 52 | 57 | 59 | 62 | 64)
+}
+
 impl GraphicsState {
+    /// The blend state for the host: as the title gave it, with blending and
+    /// logic operations off for integer targets, as the console does (one
+    /// target's description is copied to all first if the title's applies to
+    /// all). `VICTORY_INT_BLEND=1`: as the title gave it.
+    pub(crate) fn host_blend(&self) -> D3D12_BLEND_DESC {
+        static KEEP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let mut b = self.blend;
+        if *KEEP.get_or_init(|| std::env::var_os("VICTORY_INT_BLEND").is_some_and(|v| v == "1")) {
+            return b;
+        }
+        let count = (self.targets.NumRenderTargets as usize).min(8);
+        let integer: Vec<usize> = (0..count).filter(|&i| integer_format(self.targets.RTFormats[i])).collect();
+        let blends = |t: &D3D12_RENDER_TARGET_BLEND_DESC| t.BlendEnable.as_bool() || t.LogicOpEnable.as_bool();
+        let affected = integer.iter().any(|&i| {
+            blends(&b.RenderTarget[if b.IndependentBlendEnable.as_bool() { i } else { 0 }])
+        });
+        if !affected {
+            return b;
+        }
+        if !b.IndependentBlendEnable.as_bool() {
+            let first = b.RenderTarget[0];
+            b.RenderTarget = [first; 8];
+            b.IndependentBlendEnable = true.into();
+        }
+        for &i in &integer {
+            b.RenderTarget[i].BlendEnable = false.into();
+            b.RenderTarget[i].LogicOpEnable = false.into();
+        }
+        // (logic operations need one description for all targets: such a
+        // state is left as the title gave it)
+        if (0..count).any(|i| !integer.contains(&i) && b.RenderTarget[i].LogicOpEnable.as_bool()) {
+            return self.blend;
+        }
+        b
+    }
+
     /// Takes in one subobject of a stream: its type, then its data at +4
     /// (+8 for those holding pointers).
     ///
@@ -643,7 +688,7 @@ impl HostPipeline {
                     BytecodeLength: gs.len(),
                 }
             }),
-            BlendState: g.blend,
+            BlendState: g.host_blend(),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -890,7 +935,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth,
@@ -909,7 +954,7 @@ fn mesh_pipeline(
             root: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE, root.as_raw()),
             ms: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, ms),
             ps: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, ps),
-            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.blend),
+            blend: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND, g.host_blend()),
             mask: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK, g.sample_mask),
             raster: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER, g.rasterizer),
             depth: Sub(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, g.depth1()),
