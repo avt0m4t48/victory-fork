@@ -6372,6 +6372,20 @@ impl HostList {
         self.deferred.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_shadow_steps(&self, address: usize) -> (bool, bool) {
+        let mut refresh = false;
+        let mut write = false;
+        for step in &self.deferred().copies {
+            match step {
+                Step::Refresh(_, start, size) => refresh |= (*start..*start + *size).contains(&address),
+                Step::GpuWrite(_, start, size) => write |= (*start..*start + *size).contains(&address),
+                _ => {}
+            }
+        }
+        (refresh, write)
+    }
+
     /// Copies `len` bytes from `src` to `dst` when the list is submitted.
     pub(crate) fn defer_copy(&self, dst: *mut u8, src: *const u8, len: usize) {
         let mut deferred = self.deferred();
