@@ -574,6 +574,92 @@ pub(crate) fn fail(what: std::fmt::Arguments) -> ! {
     }
 }
 
+#[cfg(all(test, feature = "diagnostics"))]
+mod late_fence_probe {
+    use super::*;
+
+    pub(super) const MODE: &str = "VICTORY_TEST_LATE_FENCE_CHILD";
+    static BOTTOM_WRITE: AtomicU32 = AtomicU32::new(0);
+
+    #[test]
+    fn waits_for_a_flight_before_its_bottom_of_pipe_write() {
+        if let Ok(mode) = std::env::var(MODE) {
+            use crate::queue::Written;
+            assert!(late() && !relay());
+            on_failure(|message| {
+                assert_eq!(BOTTOM_WRITE.load(Ordering::Acquire), 0);
+                assert_eq!(FINISHED.load(Ordering::Acquire), 0);
+                assert_eq!(unsafe { host().unwrap().fence.GetCompletedValue() }, 0);
+                eprintln!("reported late-fence failure before landing: {message}");
+                std::process::exit(42);
+            });
+            let host = host().expect("isolated WARP device");
+            let list = host.new_list().unwrap();
+            list.defer_write(BOTTOM_WRITE.as_ptr().cast(), Written::Value(0x1234), 4);
+            list.close();
+            let gate: ID3D12Fence =
+                unsafe { host.device.CreateFence(0, D3D12_FENCE_FLAG_NONE) }.unwrap();
+            unsafe { host.queue.Wait(&gate, 1) }.unwrap();
+            let (mut submitted, sent) = host.submit(&[&list], true).unwrap();
+            assert_eq!(*submitted, 1);
+            assert_eq!(unsafe { host.fence.GetCompletedValue() }, 0);
+            {
+                // Use the same flight layout as execute_own, without
+                // starting a second observer of the queued flight.
+                let mut queue = line();
+                queue.target = *submitted;
+                queue.lists = 1;
+                queue.line.push(Late::Run(Flight {
+                    number: sent.number,
+                    fence: *submitted,
+                    lists: Vec::new(),
+                    order: Vec::new(),
+                    card: sent.card,
+                    back: sent.back,
+                }));
+                queue.line.extend(sent.writes.into_iter().map(|(at, what, bytes)| Late::Write(at, what, bytes)));
+            }
+            if mode == "healthy" {
+                unsafe { gate.Signal(1) }.unwrap();
+                host.settle(&mut submitted, WHY_SYNC);
+                assert_eq!(unsafe { host.fence.GetCompletedValue() }, 1);
+                assert_eq!(BOTTOM_WRITE.load(Ordering::Acquire), 0x1234);
+                assert_eq!(FINISHED.load(Ordering::Acquire), sent.number);
+                eprintln!("landed the late write after fence 1 completed");
+                return;
+            }
+            host.settle(&mut submitted, WHY_SYNC);
+            assert_eq!(unsafe { host.fence.GetCompletedValue() }, 0);
+            assert_eq!(BOTTOM_WRITE.load(Ordering::Acquire), 0x1234);
+            assert_eq!(FINISHED.load(Ordering::Acquire), sent.number);
+            eprintln!("landed the late write and published completion with fence 0 below 1");
+            unsafe {
+                gate.Signal(1).unwrap();
+                host.fence.SetEventOnCompletion(*submitted, HANDLE::default()).unwrap();
+            }
+            std::process::exit(0);
+        }
+        let mode = std::env::var("VICTORY_TEST_LATE_FENCE_MODE").unwrap_or_else(|_| "registration".into());
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "host::late_fence_probe::waits_for_a_flight_before_its_bottom_of_pipe_write", "--nocapture"])
+            .env(MODE, &mode)
+            .env("VICTORY_D3D12_WARP", "1")
+            .env("VICTORY_LATE_WAIT", "1")
+            .env("VICTORY_RELAY", "0")
+            .env_remove("VICTORY_GPU_TIMING")
+            .output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if mode == "healthy" {
+            assert_eq!(output.status.code(), Some(0), "{stderr}");
+            assert!(stderr.contains("landed the late write after fence 1 completed"), "{stderr}");
+        } else {
+            assert_eq!(output.status.code(), Some(42), "{stderr}");
+            assert!(stderr.contains("reported late-fence failure before landing"), "{stderr}");
+        }
+        eprint!("{stderr}");
+    }
+}
+
 /// The host GPU, created on first use; `None` without one (a run then
 /// behaves as before: nothing executes).
 pub(crate) fn host() -> Option<&'static Host> {
@@ -5193,10 +5279,23 @@ impl Host {
                 // SAFETY: the fence and event are ours, under the
                 // submission lock; `submitted` is the last value signalled.
                 unsafe {
-                    match self.fence.SetEventOnCompletion(*submitted, self.event) {
+                    #[cfg(all(test, feature = "diagnostics"))]
+                    let fault = std::env::var(late_fence_probe::MODE).unwrap_or_default();
+                    #[cfg(not(all(test, feature = "diagnostics")))]
+                    let fault = "";
+                    let registration = if fault == "registration" {
+                        Err(windows::Win32::Foundation::E_OUTOFMEMORY.into())
+                    } else {
+                        self.fence.SetEventOnCompletion(*submitted, self.event)
+                    };
+                    match registration {
                         Ok(()) => {
                             working(false);
-                            WaitForSingleObject(self.event, INFINITE);
+                            if fault == "wait" {
+                                windows::Win32::Foundation::SetLastError(windows::Win32::Foundation::ERROR_INVALID_HANDLE);
+                            } else {
+                                WaitForSingleObject(self.event, INFINITE);
+                            }
                             stood(waiting);
                             working(true);
                         }
