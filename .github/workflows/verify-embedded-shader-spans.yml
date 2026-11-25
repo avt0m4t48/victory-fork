@@ -41,6 +41,7 @@ jobs:
           git switch --detach ${{ matrix.revision }}
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           git rev-parse HEAD
+          New-Item -ItemType Directory -Force (Split-Path $fixture) | Out-Null
           $source = Get-Content -Raw $temp
           $source.Replace('    String::from_utf8(result.stdout).unwrap()', '    let stdout = String::from_utf8(result.stdout).unwrap(); println!("{stdout}"); stdout') | Set-Content $fixture
       - run: rustup toolchain install
